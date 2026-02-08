@@ -1,0 +1,6 @@
+# Place harmful behavior datasets here
+# Recommended datasets:
+# - AdvBench harmful behaviors (from TML/ADV-LLM/data/advbench/)
+# - MaliciousInstruct
+# - SafeLoRA SamSum bad examples
+
