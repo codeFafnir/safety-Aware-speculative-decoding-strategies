@@ -612,6 +612,14 @@ class SSDDecoderCRS(SSDDecoder):
     def _risk_score(self, p_base: torch.Tensor, p_expert: torch.Tensor,
                     selected_tok: int, expert_greedy_tok: int) -> Tuple[float, Dict]:
         """Compute r_t given the softmax distributions and token choices."""
+        # Align vocab sizes — draft and target models may differ (e.g. 151936 vs 152064)
+        v = min(p_base.shape[0], p_expert.shape[0])
+        p_base   = p_base[:v]
+        p_expert = p_expert[:v]
+        # Re-normalise after truncation so distributions still sum to 1
+        p_base   = p_base   / p_base.sum()
+        p_expert = p_expert / p_expert.sum()
+
         # w1: match mismatch (same definition as baseline)
         match = float(selected_tok == expert_greedy_tok)
 
@@ -626,9 +634,10 @@ class SSDDecoderCRS(SSDDecoder):
         H_expert = -torch.sum(p_expert * p_expert.clamp(min=1e-10).log()).item()
         dH_norm  = max(0.0, (H_base - H_expert) / self._log_vocab)
 
-        # w4: refusal token mass from safety expert
-        refusal_mass = (p_expert[self.refusal_ids].sum().item()
-                        if self.refusal_ids.numel() > 0 else 0.0)
+        # w4: refusal token mass from safety expert (filter ids within truncated vocab)
+        valid_refusal = self.refusal_ids[self.refusal_ids < v]
+        refusal_mass = (p_expert[valid_refusal].sum().item()
+                        if valid_refusal.numel() > 0 else 0.0)
 
         r_t = (self.cfg.crs_w1 * (1.0 - match)
              + self.cfg.crs_w2 * kl_norm
