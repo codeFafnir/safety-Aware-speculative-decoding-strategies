@@ -4,6 +4,116 @@
 
 ---
 
+## Setup
+
+```bash
+# Install dependencies
+pip install -r requirements.txt   # from repo root
+
+# Log in to HuggingFace (required once — models are Qwen public but login needed for some datasets)
+huggingface-cli login
+```
+
+Models and datasets download automatically on first run and are cached locally.
+
+---
+
+## `ssd_experiments.py` — Main Experiment Script
+
+Implements and compares three methods end-to-end:
+
+| Method | Description |
+|---|---|
+| `vanilla` | Target model only, no safety intervention |
+| `ssd` | SSD baseline faithful to [paper repo](https://github.com/k-k1w-w1x-x/Speculative-Safety-Aware-Decoding) |
+| `ssd_crs` | SSD + Composite Risk Score (our extension) |
+
+### Run all phases
+
+```bash
+cd SSD_variants
+python ssd_experiments.py
+```
+
+### Run individual phases
+
+Generation and evaluation are separate phases so you can re-run eval without regenerating responses.
+
+```bash
+# Generate responses only
+python ssd_experiments.py --phases vanilla ssd ssd_crs
+
+# Evaluate already-generated responses (fast — just runs Qwen3Guard)
+python ssd_experiments.py --phases eval
+
+# Run a single method and evaluate
+python ssd_experiments.py --phases ssd eval
+
+# Quick test with shorter responses
+python ssd_experiments.py --phases ssd eval --max_new_tokens 64
+
+# Disable 4-bit quantization (if you have enough VRAM)
+python ssd_experiments.py --no_4bit
+```
+
+### Output files
+
+All outputs go into `SSD_variants/` subdirectories created on first run:
+
+```
+./responses/
+    vanilla_harmful.json       # raw generated responses
+    vanilla_benign.json
+    ssd_harmful.json
+    ssd_benign.json
+    ssd_crs_harmful.json
+    ssd_crs_benign.json
+    *_eval.json                # above + guard_label per response (after eval phase)
+
+./results/
+    metrics.json               # all metrics in one file
+```
+
+### Evaluation metrics
+
+| Metric | Description |
+|---|---|
+| `ASR strict%` | % harmful responses labeled `unsafe` by Qwen3Guard |
+| `ASR lenient%` | `unsafe + 0.5*controversial` — catches partial compliance |
+| `Refusal%` | % harmful responses refused |
+| `Over-refusal%` | % benign responses incorrectly refused |
+| `Resp len (benign)` | Avg word count on benign responses — proxy for utility loss |
+
+Per-source ASR is also printed, broken down by attack type (gcg, dan, jbb, wjb, di).
+
+### Ablation flags (edit `Config` in the script)
+
+```python
+use_ppl_gate            = False   # disable perplexity-gated early union
+use_contrastive_prompts = False   # same system prompt for draft and target
+alpha_U                 = 0.0     # disable safety blending in union mode
+crs_w2                  = 0.0     # ablate KL term from CRS
+crs_w3                  = 0.0     # ablate entropy gap term from CRS
+crs_w4                  = 0.0     # ablate refusal mass term from CRS
+```
+
+### CRS extension — how it works
+
+The baseline SSD switches modes (intersection ↔ union) once every `b=7` tokens based on match ratio.
+The CRS extension replaces this with a **per-step composite risk score**:
+
+```
+r_t = w1*(1 - match) + w2*KL(p_expert||p_target) + w3*ΔH + w4*refusal_mass
+```
+
+- **KL** — soft distribution disagreement; fires even when top tokens match
+- **ΔH = H(p_target) - H(p_expert)** — target is uncertain while expert is confident → early jailbreak signal
+- **refusal_mass** — direct probability the expert places on refusal-start tokens
+
+Mode switches immediately when smoothed `r_t > crs_threshold` (no bin lag).
+
+---
+
 ## Notebooks
 
 ### `02_safedecoding_baseline_v2.ipynb` — SafeDecoding Baseline
