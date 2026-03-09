@@ -127,20 +127,41 @@ def get_local_path(model_name: str) -> str:
     return local
 
 
-def hf_load_model(model_name: str, use_4bit: bool = True):
-    """Load model with HuggingFace (used for SSD/CRS phases)."""
+def hf_load_model(model_name: str, use_4bit: bool = True,
+                  device: str = "auto", compile_model: bool = False):
+    """Load model with HuggingFace (used for SSD/CRS phases).
+
+    Args:
+        device: explicit CUDA device ("cuda:0", "cuda:1") or "auto".
+                Pinning draft→cuda:0 and target→cuda:1 keeps both GPUs
+                active and avoids layer-splitting across devices.
+        compile_model: apply torch.compile(dynamic=True) for faster
+                repeated small-kernel calls. Only effective without 4-bit.
+    """
     local = get_local_path(model_name)
-    print(f"  [HF] Loading {model_name} ...")
+    print(f"  [HF] Loading {model_name} on {device} ...")
     tok = AutoTokenizer.from_pretrained(local, trust_remote_code=True, padding_side="left")
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
-    kwargs = {"trust_remote_code": True, "device_map": "auto", "torch_dtype": torch.float16}
+    kwargs = {
+        "trust_remote_code": True,
+        "device_map": device,
+        "torch_dtype": torch.float16,
+    }
     if use_4bit:
         kwargs["quantization_config"] = BitsAndBytesConfig(
             load_in_4bit=True, bnb_4bit_quant_type="nf4",
             bnb_4bit_compute_dtype=torch.float16, bnb_4bit_use_double_quant=True)
     model = AutoModelForCausalLM.from_pretrained(local, **kwargs)
     model.eval()
+    if compile_model and not use_4bit:
+        # torch.compile reduces Python overhead between small KV-cache kernel launches.
+        # dynamic=True handles variable sequence lengths (growing KV cache).
+        # Not compatible with bitsandbytes 4-bit.
+        print(f"  Compiling {model_name} (first prompt will be slow) ...")
+        model = torch.compile(model, dynamic=True)
+    elif compile_model and use_4bit:
+        print("  Warning: --compile ignored with 4-bit models (use --no_4bit to enable)")
     return model, tok
 
 
@@ -765,12 +786,23 @@ class SSDDecoderCRS(SSDDecoder):
 # SSD / CRS PHASE RUNNERS  (HuggingFace backend)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def run_phase_ssd(harmful: List[Dict], benign: List[Dict]):
+def _load_ssd_models(compile_model: bool = False):
+    """Load draft + target on separate GPUs if available, else auto."""
+    n_gpu = torch.cuda.device_count()
+    draft_device  = "cuda:0" if n_gpu >= 1 else "auto"
+    target_device = "cuda:1" if n_gpu >= 2 else "auto"
+    draft, tok = hf_load_model(config.draft_model, config.use_4bit,
+                               device=draft_device, compile_model=compile_model)
+    target, _  = hf_load_model(config.target_model, config.use_4bit,
+                               device=target_device, compile_model=compile_model)
+    return draft, target, tok
+
+
+def run_phase_ssd(harmful: List[Dict], benign: List[Dict], compile_model: bool = False):
     print("\n" + "="*60)
     print("PHASE 2: SSD BASELINE  (HF + KV-cache)")
     print("="*60)
-    draft, tok = hf_load_model(config.draft_model, config.use_4bit)
-    target, _  = hf_load_model(config.target_model, config.use_4bit)
+    draft, target, tok = _load_ssd_models(compile_model)
     dec = SSDDecoder(draft, target, tok, config)
 
     for split_name, items, fname in [
@@ -786,12 +818,11 @@ def run_phase_ssd(harmful: List[Dict], benign: List[Dict]):
     hf_unload(draft, target)
 
 
-def run_phase_ssd_crs(harmful: List[Dict], benign: List[Dict]):
+def run_phase_ssd_crs(harmful: List[Dict], benign: List[Dict], compile_model: bool = False):
     print("\n" + "="*60)
     print("PHASE 3: SSD-CRS  (HF + KV-cache)")
     print("="*60)
-    draft, tok = hf_load_model(config.draft_model, config.use_4bit)
-    target, _  = hf_load_model(config.target_model, config.use_4bit)
+    draft, target, tok = _load_ssd_models(compile_model)
     dec = SSDDecoderCRS(draft, target, tok, config)
 
     for split_name, items, fname in [
@@ -1017,7 +1048,11 @@ def main():
                         default=["all"])
     parser.add_argument("--max_new_tokens", type=int, default=256)
     parser.add_argument("--no_4bit",       action="store_true",
-                        help="Disable 4-bit quantization for HF models (SSD/CRS)")
+                        help="Use float16 instead of 4-bit quant (recommended with 2 GPUs: "
+                             "draft ~3GB on cuda:0, target ~14GB on cuda:1)")
+    parser.add_argument("--compile",       action="store_true",
+                        help="torch.compile models for faster repeated KV-cache calls "
+                             "(requires --no_4bit; first prompt is slow due to warm-up)")
     parser.add_argument("--vllm_gpu_util", type=float, default=None,
                         help="vLLM GPU memory fraction (default: 0.85)")
     parser.add_argument("--enforce_eager", action="store_true",
@@ -1038,8 +1073,8 @@ def main():
     harmful, benign = build_datasets()
 
     if run_all or "vanilla" in phases: run_phase_vanilla(harmful, benign)
-    if run_all or "ssd"     in phases: run_phase_ssd(harmful, benign)
-    if run_all or "ssd_crs" in phases: run_phase_ssd_crs(harmful, benign)
+    if run_all or "ssd"     in phases: run_phase_ssd(harmful, benign, compile_model=args.compile)
+    if run_all or "ssd_crs" in phases: run_phase_ssd_crs(harmful, benign, compile_model=args.compile)
     if run_all or "eval"    in phases:
         metrics = run_evaluation()
         print_results(metrics)
