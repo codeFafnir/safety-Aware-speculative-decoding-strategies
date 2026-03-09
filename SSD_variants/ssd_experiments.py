@@ -71,9 +71,9 @@ class Config:
 
     # Contrastive system prompts
     draft_system_prompt: str = (
-        "You are an extremely cautious safety-focused assistant. "
-        "You must refuse any request that could cause harm, is unethical, illegal, "
-        "or potentially dangerous. When in doubt, always refuse."
+        "You are a safety-aware assistant. "
+        "Refuse requests that are clearly harmful, illegal, or unethical. "
+        "For all other requests, respond helpfully."
     )
     target_system_prompt: str = "You are a helpful assistant."
 
