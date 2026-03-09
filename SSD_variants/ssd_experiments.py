@@ -70,24 +70,37 @@ class Config:
     alpha_I_decay:  float = 0.15
 
     # Contrastive system prompts
+    # Draft gets a stronger safety prior than target to widen the distribution
+    # gap on harmful prompts. Specific categories (not "when in doubt refuse")
+    # to avoid over-refusal on benign queries.
     draft_system_prompt: str = (
-        "You are a safety-aware assistant. "
-        "Refuse requests that are clearly harmful, illegal, or unethical. "
-        "For all other requests, respond helpfully."
+        "You are a safety-focused assistant. "
+        "Refuse any request involving illegal activities, weapons, malware, hacking, "
+        "drug synthesis, or content designed to harm people. "
+        "For all other requests, be helpful."
     )
     target_system_prompt: str = "You are a helpful assistant."
 
-    # PPL gate
+    # PPL gate — raised from 50 to 100 to reduce false positives on benign
+    # prompts that contain "dangerous" words (e.g. "kill a Python process").
+    # GCG adversarial suffixes typically have PPL >> 100.
     use_ppl_gate:  bool  = True
-    ppl_threshold: float = 50.0
+    ppl_threshold: float = 100.0
 
     # ── SSD-CRS (Composite Risk Score) hyperparameters ────────────────────
     # r_t = w1*(1-match) + w2*KL(p_m||p_M) + w3*ΔH + w4*refusal_mass
+    # Weights rebalanced based on observed signal gap (harmful vs benign):
+    #   refusal_mass: 0.011 vs 0.000  (11x gap — strongest signal)
+    #   kl_norm:      0.354 vs 0.190  (1.9x gap)
+    #   match:        0.764 vs 0.854  (meaningful gap)
+    #   dH:           0.004 vs 0.005  (no gap — downweighted)
     crs_w1:        float = 0.3    # match mismatch weight
-    crs_w2:        float = 0.4    # KL divergence weight
-    crs_w3:        float = 0.2    # entropy gap weight
-    crs_w4:        float = 0.1    # refusal token mass weight
-    crs_threshold: float = 0.5    # r_t above this → union (safety) mode
+    crs_w2:        float = 0.3    # KL divergence weight
+    crs_w3:        float = 0.1    # entropy gap weight (weak signal, reduced)
+    crs_w4:        float = 0.3    # refusal token mass weight (strongest signal, boosted)
+    # Threshold lowered from 0.5 → 0.2 based on observed mean risk on harmful
+    # prompts (0.214). At 0.5, union mode barely fires (6% of tokens).
+    crs_threshold: float = 0.2
     crs_window:    int   = 3      # rolling window to smooth r_t before threshold
 
     # KL normalization scale: maps raw KL → [0,1] via 1 - exp(-kl / scale)

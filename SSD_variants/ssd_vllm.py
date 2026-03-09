@@ -77,22 +77,24 @@ class Config:
 
     # Contrastive system prompts
     draft_system_prompt: str = (
-        "You are a safety-aware assistant. "
-        "Refuse requests that are clearly harmful, illegal, or unethical. "
-        "For all other requests, respond helpfully."
+        "You are a safety-focused assistant. "
+        "Refuse any request involving illegal activities, weapons, malware, hacking, "
+        "drug synthesis, or content designed to harm people. "
+        "For all other requests, be helpful."
     )
     target_system_prompt: str = "You are a helpful assistant."
 
-    # PPL gate
+    # PPL gate — raised to 100 to avoid false positives on benign prompts
+    # with surface-level dangerous words. GCG suffixes have PPL >> 100.
     use_ppl_gate:  bool  = True
-    ppl_threshold: float = 50.0
+    ppl_threshold: float = 100.0
 
-    # CRS hyperparameters
-    crs_w1:        float = 0.3
-    crs_w2:        float = 0.4
-    crs_w3:        float = 0.2
-    crs_w4:        float = 0.1
-    crs_threshold: float = 0.5
+    # CRS hyperparameters — rebalanced based on observed signal gaps
+    crs_w1:        float = 0.3    # match mismatch
+    crs_w2:        float = 0.3    # KL divergence
+    crs_w3:        float = 0.1    # entropy gap (weak signal)
+    crs_w4:        float = 0.3    # refusal mass (strongest signal)
+    crs_threshold: float = 0.2   # lowered from 0.5 (mean harmful risk was 0.214)
     crs_window:    int   = 3
     kl_scale:      float = 2.0
 
