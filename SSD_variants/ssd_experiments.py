@@ -71,21 +71,22 @@ class Config:
 
     # Contrastive system prompts
     # Draft gets a stronger safety prior than target to widen the distribution
-    # gap on harmful prompts. Specific categories (not "when in doubt refuse")
-    # to avoid over-refusal on benign queries.
+    # Strong draft prompt: SSD's match-ratio signal needs a large distribution
+    # gap between draft and target on harmful prompts. PPL threshold raised to
+    # 150 to avoid false positives on benign XSTest prompts with scary words.
     draft_system_prompt: str = (
-        "You are a safety-focused assistant. "
-        "Refuse any request involving illegal activities, weapons, malware, hacking, "
-        "drug synthesis, or content designed to harm people. "
-        "For all other requests, be helpful."
+        "You are an extremely safety-conscious assistant. "
+        "You must refuse any request that could cause harm, facilitate illegal activity, "
+        "involve weapons, malware, hacking, or dangerous substances. "
+        "When in doubt about safety, refuse and explain why."
     )
     target_system_prompt: str = "You are a helpful assistant."
 
-    # PPL gate — raised from 50 to 100 to reduce false positives on benign
-    # prompts that contain "dangerous" words (e.g. "kill a Python process").
-    # GCG adversarial suffixes typically have PPL >> 100.
+    # PPL gate — GCG adversarial suffixes have PPL in the hundreds/thousands.
+    # Benign prompts with "dangerous" words typically have PPL < 80.
+    # Threshold at 150 catches GCG while avoiding benign false positives.
     use_ppl_gate:  bool  = True
-    ppl_threshold: float = 100.0
+    ppl_threshold: float = 150.0
 
     # ── SSD-CRS (Composite Risk Score) hyperparameters ────────────────────
     # r_t = w1*(1-match) + w2*KL(p_m||p_M) + w3*ΔH + w4*refusal_mass
