@@ -330,21 +330,32 @@ def load_xstest(n: int) -> List[Dict]:
 
 
 def build_datasets() -> Tuple[List[Dict], List[Dict]]:
+    """
+    Load datasets from committed ./data/ files (run prepare_datasets.py first).
+    Falls back to live download if a file is missing — but for reproducibility
+    all teammates should use the committed JSON files.
+    """
     print("Loading datasets ...")
     harmful, benign = [], []
 
-    for name, loader, n in [
-        ("BeaverTails",      load_beavertails,    config.num_harmbench),
-        ("DAN/AdvBench",     load_advbench_dan,   config.num_advbench),
-        ("WildJailbreak",    load_wildjailbreak,  config.num_wildjailbreak),
-        ("JailbreakBench",   load_jailbreakbench, config.num_jailbreakbench),
-        ("DeepInception",    load_deepinception,  config.num_deepinception),
+    for name, fname, loader, n in [
+        ("BeaverTails",    "beavertails.json",    load_beavertails,    config.num_harmbench),
+        ("DAN/AdvBench",   "dan_prompts.json",    load_advbench_dan,   config.num_advbench),
+        ("WildJailbreak",  None,                  load_wildjailbreak,  config.num_wildjailbreak),
+        ("JailbreakBench", "jailbreakbench.json", load_jailbreakbench, config.num_jailbreakbench),
+        ("DeepInception",  "deepinception.json",  load_deepinception,  config.num_deepinception),
     ]:
-        subset = loader(n)
+        committed = os.path.join(config.data_dir, fname) if fname else None
+        if committed and os.path.exists(committed):
+            subset = json.load(open(committed))[:n]
+        else:
+            subset = loader(n)
         harmful.extend(subset)
         print(f"  {name}: {len(subset)}")
 
-    benign = load_xstest(config.num_xstest)
+    committed_xs = os.path.join(config.data_dir, "xstest.json")
+    benign = (json.load(open(committed_xs))[:config.num_xstest]
+              if os.path.exists(committed_xs) else load_xstest(config.num_xstest))
     print(f"  XSTest (benign): {len(benign)}")
     print(f"  Total harmful: {len(harmful)}, benign: {len(benign)}")
     return harmful, benign

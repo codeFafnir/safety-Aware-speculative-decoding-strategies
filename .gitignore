@@ -1,0 +1,28 @@
+# Model weights (large, download separately)
+downloaded_models/
+*.bin
+*.safetensors
+*.pt
+*.pth
+
+# Generated responses and metrics (machine-specific, re-run to reproduce)
+SSD_variants/responses/
+SSD_variants/results/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.ipynb_checkpoints/
+*.egg-info/
+dist/
+build/
+
+# Env
+.env
+*.log
+
+# OS
+.DS_Store
+
+# data/ is intentionally NOT ignored — commit it for reproducibility
