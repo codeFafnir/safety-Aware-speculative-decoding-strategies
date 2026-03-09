@@ -407,6 +407,36 @@ class SSDDecoder:
         out = model(input_ids=ids.to(dev))
         return out.logits[0, -n_positions:, :].float().cpu()
 
+    # ── KV-cache helpers ──────────────────────────────────────────────────────
+
+    @torch.no_grad()
+    def _init_kv(self, model, ids):
+        """Full forward pass on ids. Returns (last_logit cpu, past_key_values on device)."""
+        dev = next(model.parameters()).device
+        out = model(input_ids=ids.to(dev), use_cache=True)
+        last_logit = out.logits[0, -1, :].float().cpu()
+        return last_logit, out.past_key_values
+
+    @torch.no_grad()
+    def _forward_one(self, model, token_id: int, past_kv):
+        """Single-token step with KV cache. Returns (logit cpu, new past_key_values)."""
+        dev = next(model.parameters()).device
+        inp = torch.tensor([[token_id]], dtype=torch.long, device=dev)
+        out = model(input_ids=inp, past_key_values=past_kv, use_cache=True)
+        logit = out.logits[0, -1, :].float().cpu()
+        return logit, out.past_key_values
+
+    @torch.no_grad()
+    def _forward_batch(self, model, token_ids: list, past_kv):
+        """Batch-token step with KV cache. Returns (logits cpu [k, vocab], new past_key_values)."""
+        if not token_ids:
+            return torch.empty(0), past_kv
+        dev = next(model.parameters()).device
+        inp = torch.tensor([token_ids], dtype=torch.long, device=dev)
+        out = model(input_ids=inp, past_key_values=past_kv, use_cache=True)
+        logits = out.logits[0].float().cpu()   # (k, vocab)
+        return logits, out.past_key_values
+
     @torch.no_grad()
     def _prompt_ppl(self, ids):
         ids = ids.to(self.draft_dev)
@@ -501,30 +531,31 @@ class SSDDecoder:
         union_tok = inter_tok = mode_sw = 0
         t0 = time.time()
 
+        # ── Initialise KV caches from prompts (one full pass each) ────────
+        d_last_logits, d_kv = self._init_kv(self.draft,  d_ids)
+        t_last_logits, t_kv = self._init_kv(self.target, t_ids)
+
         steps = 0
         while steps < max_new_tokens:
-            # ── Draft: expert greedily generates T tokens ─────────────────
-            expert_draft_probs = []   # softmax distributions at each draft step
-            expert_draft_tokens = []  # greedy token choices
-            d_ids_draft = d_ids.clone()
+            # ── Draft: T tokens greedily via rolling KV (O(1)/token) ──────
+            expert_draft_probs  = [torch.softmax(d_last_logits, dim=-1)]
+            expert_draft_tokens = [int(torch.argmax(d_last_logits).item())]
+            d_kv_rolling = d_kv
+            for i in range(1, T):
+                logit_i, d_kv_rolling = self._forward_one(
+                    self.draft, expert_draft_tokens[i - 1], d_kv_rolling)
+                expert_draft_probs.append(torch.softmax(logit_i, dim=-1))
+                expert_draft_tokens.append(int(torch.argmax(logit_i).item()))
 
-            for i in range(T):
-                ld = self._logits_last(self.draft, d_ids_draft)
-                pd = torch.softmax(ld, dim=-1)
-                expert_draft_probs.append(pd)
-                next_tok = int(torch.argmax(pd).item())
-                expert_draft_tokens.append(next_tok)
-                if i < T - 1:
-                    d_ids_draft = torch.cat(
-                        [d_ids_draft, torch.tensor([[next_tok]], dtype=torch.long)], dim=1)
-
-            # ── Verify: base model scores all T positions in one pass ──────
-            # Append first T-1 draft tokens to base context for parallel scoring
-            t_ids_ext = t_ids
-            for tok in expert_draft_tokens[:-1]:
-                t_ids_ext = torch.cat(
-                    [t_ids_ext, torch.tensor([[tok]], dtype=torch.long)], dim=1)
-            base_logits_T = self._logits_multi(self.target, t_ids_ext, T)  # (T, vocab)
+            # ── Verify: target scores T positions (one batched pass) ───────
+            # base_probs[0] is free from t_last_logits; no extra forward needed.
+            # Feed draft_tokens[0..T-2] into target with existing t_kv (not updated).
+            base_probs = [torch.softmax(t_last_logits, dim=-1)]
+            if T > 1:
+                batch_logits, _ = self._forward_batch(
+                    self.target, expert_draft_tokens[:-1], t_kv)
+                for j in range(T - 1):
+                    base_probs.append(torch.softmax(batch_logits[j], dim=-1))
 
             # ── Accept/reject with safety filtering ───────────────────────
             accepted_this_step = []
@@ -532,8 +563,8 @@ class SSDDecoder:
                 if steps >= max_new_tokens:
                     break
 
-                p_base   = torch.softmax(base_logits_T[i], dim=-1)
-                p_expert = expert_draft_probs[i]
+                p_base        = base_probs[i]
+                p_expert      = expert_draft_probs[i]
                 expert_greedy = expert_draft_tokens[i]
 
                 if mode == 1:
@@ -543,7 +574,6 @@ class SSDDecoder:
                     selected = self._select_union(p_base, p_expert, C, self.cfg.alpha_U)
                     union_tok += 1
 
-                # Match = selected token equals expert's greedy draft (paper definition)
                 matched = int(selected == expert_greedy)
                 match_log.append(matched)
                 accepted_this_step.append(selected)
@@ -551,17 +581,20 @@ class SSDDecoder:
 
                 if selected == self.tok.eos_token_id:
                     break
-
-                # Break speculative chain on first mismatch (paper behaviour)
                 if not matched:
                     break
 
-            # Update contexts with accepted tokens
-            for tok in accepted_this_step:
-                tt = torch.tensor([[tok]], dtype=torch.long)
-                t_ids = torch.cat([t_ids, tt], dim=1)
-                d_ids = torch.cat([d_ids, tt], dim=1)
-                generated.append(tok)
+            # ── Update KV caches with accepted tokens (O(k)/step) ─────────
+            if accepted_this_step:
+                draft_batch, d_kv = self._forward_batch(
+                    self.draft, accepted_this_step, d_kv)
+                d_last_logits = draft_batch[-1]
+
+                target_batch, t_kv = self._forward_batch(
+                    self.target, accepted_this_step, t_kv)
+                t_last_logits = target_batch[-1]
+
+                generated.extend(accepted_this_step)
 
             if generated and generated[-1] == self.tok.eos_token_id:
                 break
@@ -704,38 +737,38 @@ class SSDDecoderCRS(SSDDecoder):
         union_tok  = inter_tok = mode_sw = 0
         t0 = time.time()
 
+        # ── Initialise KV caches from prompts ─────────────────────────────
+        d_last_logits, d_kv = self._init_kv(self.draft,  d_ids)
+        t_last_logits, t_kv = self._init_kv(self.target, t_ids)
+
         steps = 0
         while steps < max_new_tokens:
-            # ── Draft: expert greedily generates T tokens (same as baseline) ─
-            expert_draft_probs  = []
-            expert_draft_tokens = []
-            d_ids_draft = d_ids.clone()
+            # ── Draft: T tokens greedily via rolling KV (O(1)/token) ──────
+            expert_draft_probs  = [torch.softmax(d_last_logits, dim=-1)]
+            expert_draft_tokens = [int(torch.argmax(d_last_logits).item())]
+            d_kv_rolling = d_kv
+            for i in range(1, T):
+                logit_i, d_kv_rolling = self._forward_one(
+                    self.draft, expert_draft_tokens[i - 1], d_kv_rolling)
+                expert_draft_probs.append(torch.softmax(logit_i, dim=-1))
+                expert_draft_tokens.append(int(torch.argmax(logit_i).item()))
 
-            for i in range(T):
-                ld = self._logits_last(self.draft, d_ids_draft)
-                pd = torch.softmax(ld, dim=-1)
-                expert_draft_probs.append(pd)
-                next_tok = int(torch.argmax(pd).item())
-                expert_draft_tokens.append(next_tok)
-                if i < T - 1:
-                    d_ids_draft = torch.cat(
-                        [d_ids_draft, torch.tensor([[next_tok]], dtype=torch.long)], dim=1)
+            # ── Verify: target scores T positions (one batched pass) ───────
+            base_probs = [torch.softmax(t_last_logits, dim=-1)]
+            if T > 1:
+                batch_logits, _ = self._forward_batch(
+                    self.target, expert_draft_tokens[:-1], t_kv)
+                for j in range(T - 1):
+                    base_probs.append(torch.softmax(batch_logits[j], dim=-1))
 
-            # ── Verify: base model scores all T positions in one pass ─────────
-            t_ids_ext = t_ids
-            for tok in expert_draft_tokens[:-1]:
-                t_ids_ext = torch.cat(
-                    [t_ids_ext, torch.tensor([[tok]], dtype=torch.long)], dim=1)
-            base_logits_T = self._logits_multi(self.target, t_ids_ext, T)
-
-            # ── Accept/reject with CRS-based switching ────────────────────────
+            # ── Accept/reject with CRS-based switching ────────────────────
             accepted_this_step = []
             for i in range(T):
                 if steps >= max_new_tokens:
                     break
 
-                p_base   = torch.softmax(base_logits_T[i], dim=-1)
-                p_expert = expert_draft_probs[i]
+                p_base        = base_probs[i]
+                p_expert      = expert_draft_probs[i]
                 expert_greedy = expert_draft_tokens[i]
 
                 if mode == 1:
@@ -761,15 +794,20 @@ class SSDDecoderCRS(SSDDecoder):
 
                 if selected == self.tok.eos_token_id:
                     break
-                # Still break speculative chain on mismatch (same as baseline)
                 if selected != expert_greedy:
                     break
 
-            for tok in accepted_this_step:
-                tt = torch.tensor([[tok]], dtype=torch.long)
-                t_ids = torch.cat([t_ids, tt], dim=1)
-                d_ids = torch.cat([d_ids, tt], dim=1)
-                generated.append(tok)
+            # ── Update KV caches with accepted tokens (O(k)/step) ─────────
+            if accepted_this_step:
+                draft_batch, d_kv = self._forward_batch(
+                    self.draft, accepted_this_step, d_kv)
+                d_last_logits = draft_batch[-1]
+
+                target_batch, t_kv = self._forward_batch(
+                    self.target, accepted_this_step, t_kv)
+                t_last_logits = target_batch[-1]
+
+                generated.extend(accepted_this_step)
 
             if generated and generated[-1] == self.tok.eos_token_id:
                 break
