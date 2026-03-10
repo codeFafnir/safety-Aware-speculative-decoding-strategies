@@ -235,10 +235,18 @@ class SSDDecoderSteering(SSDDecoderCRS):
         return logits, out.past_key_values, hidden
 
     def _apply_steering(self, t_hidden: torch.Tensor, smoothed_crs: float):
-        """Project target hidden state → g_t, scale by CRS risk, set injector."""
+        """Project target hidden state → g_t, scale by CRS risk, set injector.
+
+        t_hidden is normalized to unit norm before the proj so that g_t always
+        has consistent magnitude (~0.686 for this proj), regardless of the
+        RMSNorm weight scaling in the target model (raw norm ≈ 295).
+        Without normalization the injection is ~295× too large, causing
+        complete token-distribution collapse.
+        """
         proj_dev = next(self.proj.parameters()).device
         with torch.no_grad():
-            g_t = self.proj(t_hidden.to(proj_dev)).cpu()
+            h_unit = t_hidden / (t_hidden.norm() + 1e-8)
+            g_t = self.proj(h_unit.to(proj_dev)).cpu()
         scale = self.scfg.base_magnitude * (1.0 + self.scfg.amplify * smoothed_crs)
         self.injector.set(g_t, scale)
 
