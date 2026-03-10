@@ -160,13 +160,16 @@ def hf_load_model(model_name: str, use_4bit: bool = True,
             bnb_4bit_compute_dtype=torch.float16, bnb_4bit_use_double_quant=True)
     else:
         # Flash Attention 2 gives the same attention kernel vLLM uses.
-        # Requires flash-attn package; falls back silently if unavailable.
-        try:
-            kwargs["attn_implementation"] = "flash_attention_2"
+        # Falls back to default attention if flash-attn is not installed.
+        kwargs["attn_implementation"] = "flash_attention_2"
+    try:
+        model = AutoModelForCausalLM.from_pretrained(local, **kwargs)
+        if not use_4bit:
             print(f"    Using Flash Attention 2")
-        except Exception:
-            pass
-    model = AutoModelForCausalLM.from_pretrained(local, **kwargs)
+    except (ImportError, ValueError):
+        print(f"    flash-attn not installed, falling back to default attention")
+        kwargs.pop("attn_implementation", None)
+        model = AutoModelForCausalLM.from_pretrained(local, **kwargs)
     model.eval()
     if compile_model and not use_4bit:
         # torch.compile reduces Python overhead between small KV-cache kernel launches.

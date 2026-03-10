@@ -25,4 +25,7 @@ build/
 # OS
 .DS_Store
 
+# Steering projection checkpoints (trained weights, re-train to reproduce)
+SSD_variants/steering_ckpts/
+
 # data/ is intentionally NOT ignored — commit it for reproducibility
