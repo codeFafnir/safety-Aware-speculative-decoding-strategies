@@ -531,12 +531,14 @@ def pretrain_projection(
     optimizer = torch.optim.AdamW(proj.parameters(), lr=scfg.train_lr)
 
     print(f"  Phase 2: training projection, {scfg.train_epochs} epochs ...")
-    print(f"  Objective: KL(p_verifier || p_steered_draft) per sampled position")
+    print(f"  Objective: KL(p_verifier || p_steered_draft) — batched over all positions")
 
-    def make_hook(g_vec, s):
+    # Batched hook: injects different g per sequence position in one forward pass.
+    # g_batch: [n_pos, d_hidden] on GPU; output: [1, n_pos, d_hidden]
+    def make_batched_hook(g_batch, s):
         def hook(module, inp, output):
-            gv = g_vec.to(device=output.device, dtype=output.dtype)
-            return output + gv.view(1, 1, -1) * s
+            gv = g_batch.to(device=output.device, dtype=output.dtype)
+            return output + gv.unsqueeze(0) * s   # [1, n_pos, d_hidden]
         return hook
 
     for epoch in range(scfg.train_epochs):
@@ -545,40 +547,37 @@ def pretrain_projection(
         total_loss = 0.0
 
         for h_pos, p_pos, ids_pos in tqdm(cache, desc=f"  Epoch {epoch+1}"):
-            # h_pos: [n_pos, t_hidden]  p_pos: [n_pos, vocab]  ids_pos: [1, n_pos]
+            # h_pos: [n_pos, t_hidden]   p_pos: [n_pos, vocab]   ids_pos: [1, n_pos]
             optimizer.zero_grad()
-            seq_loss = torch.tensor(0.0, device=proj_dev)
 
-            for i in range(h_pos.shape[0]):
-                # Project one cached hidden state → g [d_hidden], grad flows
-                g = proj(h_pos[i].to(proj_dev))
+            # ── ONE proj forward for all positions ───────────────────────
+            g_all = proj(h_pos.to(proj_dev))   # [n_pos, d_hidden], grad flows
 
-                # Install hooks
-                handles = []
-                for layer in draft_layers:
-                    mlp = getattr(layer, "mlp", None)
-                    if mlp is not None:
-                        handles.append(mlp.register_forward_hook(make_hook(g, scale)))
+            # ── ONE set of hooks covering all positions ──────────────────
+            handles = []
+            for layer in draft_layers:
+                mlp = getattr(layer, "mlp", None)
+                if mlp is not None:
+                    handles.append(mlp.register_forward_hook(
+                        make_batched_hook(g_all, scale)))
 
-                # Single token forward on the draft at this position
-                tok_id = ids_pos[:, i:i+1]
-                logits_d = draft(input_ids=tok_id.to(d_dev)).logits[0, -1, :].float()
+            # ── ONE draft forward on all n_pos tokens as a sequence ──────
+            logits_d = draft(input_ids=ids_pos.to(d_dev)).logits[0].float()  # [n_pos, vocab]
 
-                for h in handles:
-                    h.remove()
+            for h in handles:
+                h.remove()
 
-                # KL(p_V || p_D_steered) — truncate vocab mismatch
-                v = min(logits_d.shape[0], p_pos.shape[1])
-                log_p_d = F.log_softmax(logits_d[:v].to(proj_dev), dim=-1)
-                p_v     = p_pos[i, :v].to(proj_dev)
-                p_v     = p_v / p_v.sum()
-                kl = F.kl_div(log_p_d, p_v, reduction="sum")
-                seq_loss = seq_loss + kl / h_pos.shape[0]
+            # ── Batched KL over all positions ────────────────────────────
+            v = min(logits_d.shape[1], p_pos.shape[1])
+            log_p_d = F.log_softmax(logits_d[:, :v].to(proj_dev), dim=-1)  # [n_pos, v]
+            p_v     = p_pos[:, :v].to(proj_dev)
+            p_v     = p_v / p_v.sum(dim=-1, keepdim=True)
+            loss    = F.kl_div(log_p_d, p_v, reduction="batchmean")
 
-            seq_loss.backward()
+            loss.backward()
             torch.nn.utils.clip_grad_norm_(proj.parameters(), 1.0)
             optimizer.step()
-            total_loss += seq_loss.item()
+            total_loss += loss.item()
 
         avg = total_loss / max(len(cache), 1)
         print(f"  Epoch {epoch+1}/{scfg.train_epochs}  avg_KL={avg:.4f}")
