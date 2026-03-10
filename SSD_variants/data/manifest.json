@@ -1,17 +1,14 @@
 {
   "deepinception.json": {
-    "n": 10,
-    "sha256": "f9729260366c",
-    "source": "hardcoded"
+    "n": 40,
+    "sha256": "30b6fb114b88"
+  },
+  "jbb_wrapped.json": {
+    "n": 30,
+    "sha256": "fa8045d51fdc"
   },
   "xstest.json": {
     "n": 30,
-    "sha256": "35097de9cfa2",
-    "source": "hardcoded"
-  },
-  "advbench.json": {
-    "n": 100,
-    "sha256": "c736d956d487",
-    "source": "huggingface"
+    "sha256": "35097de9cfa2"
   }
 }
