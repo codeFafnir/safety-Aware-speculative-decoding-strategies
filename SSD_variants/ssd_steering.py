@@ -650,20 +650,20 @@ def run_phase_steering(harmful: List[Dict], benign: List[Dict],
 
     decoder = SSDDecoderSteering(draft, target, tok, config, scfg, proj)
 
+    h_path = os.path.join(config.responses_dir, "ssd_steering_harmful.json")
+    b_path = os.path.join(config.responses_dir, "ssd_steering_benign.json")
     results_h, results_b = [], []
     for item in tqdm(harmful, desc="ssd_steering harmful"):
         resp, lat, stats = decoder.generate(item["prompt"], config.max_new_tokens)
         results_h.append({**item, "response": resp, "latency": lat,
                           "method": "ssd_steering", **stats})
-    save_responses(results_h,
-                   os.path.join(config.responses_dir, "ssd_steering_harmful.json"))
+        save_responses(results_h, h_path)   # stream: save after every prompt
 
     for item in tqdm(benign, desc="ssd_steering benign"):
         resp, lat, stats = decoder.generate(item["prompt"], config.max_new_tokens)
         results_b.append({**item, "response": resp, "latency": lat,
                           "method": "ssd_steering", **stats})
-    save_responses(results_b,
-                   os.path.join(config.responses_dir, "ssd_steering_benign.json"))
+        save_responses(results_b, b_path)   # stream: save after every prompt
 
     decoder.injector.remove()
     unload(draft)
