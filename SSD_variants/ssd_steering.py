@@ -210,13 +210,13 @@ class SSDDecoderSteering(SSDDecoderCRS):
 
     @staticmethod
     def _grab_last_hidden(model) -> Tuple[dict, object]:
-        """Register a one-shot hook on the final transformer layer to capture
-        the last-token hidden state without output_hidden_states=True (which
-        stores all 28 layers — ~27x more memory than we need)."""
+        """Register a one-shot hook on model.norm (final RMSNorm before LM head)
+        to capture the last-token hidden state. model.norm outputs a plain
+        [batch, seq_len, hidden] tensor — no tuple wrapping — making it
+        unambiguous across device_map=auto and attention variants."""
         buf = {}
-        last_layer = model.model.layers[-1]
-        hook = last_layer.register_forward_hook(
-            lambda m, inp, out: buf.__setitem__('h', out[0][0, -1, :].detach().float().cpu())
+        hook = model.model.norm.register_forward_hook(
+            lambda m, inp, out: buf.__setitem__('h', out[0, -1, :].detach().float().cpu())
         )
         return buf, hook
 
@@ -499,10 +499,11 @@ def _extract_target_cache(target, seqs, max_positions: int = 32):
     cache = []  # list of (h [n_pos, t_hidden], p_V [n_pos, vocab], ids)
     for ids in tqdm(seqs, desc="  Extracting target hidden states"):
         with torch.no_grad():
-            # Hook on final layer — avoids materialising all 28 layers of hidden states
+            # Hook model.norm (final RMSNorm) — outputs plain [batch, seq_len, hidden]
+            # tensor, unambiguous across device_map=auto and attention variants.
             h_buf = {}
-            hook  = target.model.layers[-1].register_forward_hook(
-                lambda m, inp, out: h_buf.__setitem__('h', out[0][0].detach().float().cpu()))
+            hook  = target.model.norm.register_forward_hook(
+                lambda m, inp, out: h_buf.__setitem__('h', out[0].detach().float().cpu()))
             out   = target(input_ids=ids.to(t_dev))
             hook.remove()
             h_all = h_buf['h']                                           # [seq_len, t_hidden]
