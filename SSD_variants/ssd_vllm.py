@@ -49,7 +49,7 @@ class Config:
     draft_model:  str = "Qwen/Qwen2.5-1.5B-Instruct"
     target_model: str = "Qwen/Qwen2.5-7B-Instruct"
     guard_model:  str = "Qwen/Qwen3Guard-Gen-0.6B"
-    use_4bit:     bool = True
+    use_4bit:     bool = False
     max_new_tokens: int = 256
 
     # Paths
