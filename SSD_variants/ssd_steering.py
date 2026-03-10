@@ -208,43 +208,31 @@ class SSDDecoderSteering(SSDDecoderCRS):
 
     # ── KV helpers that also return hidden states ──────────────────────────
 
-    @staticmethod
-    def _grab_last_hidden(model) -> Tuple[dict, object]:
-        """Register a one-shot hook on model.norm (final RMSNorm before LM head)
-        to capture the last-token hidden state. model.norm outputs a plain
-        [batch, seq_len, hidden] tensor — no tuple wrapping — making it
-        unambiguous across device_map=auto and attention variants."""
-        buf = {}
-        hook = model.model.norm.register_forward_hook(
-            lambda m, inp, out: buf.__setitem__('h', out[0, -1, :].detach().float().cpu())
-        )
-        return buf, hook
-
     @torch.no_grad()
     def _init_kv_h(self, model, ids) -> Tuple[torch.Tensor, object, torch.Tensor]:
         """Full forward pass: returns (last_logit, past_kv, last_hidden).
-        Uses a last-layer hook instead of output_hidden_states=True."""
+        Uses output_hidden_states=True and extracts only the final layer,
+        which is reliable across device_map=auto configurations."""
         dev = next(model.parameters()).device
-        buf, hook = self._grab_last_hidden(model)
-        out = model(input_ids=ids.to(dev), use_cache=True)
-        hook.remove()
+        out    = model(input_ids=ids.to(dev), use_cache=True, output_hidden_states=True)
         logit  = out.logits[0, -1, :].float().cpu()
-        return logit, out.past_key_values, buf['h']
+        hidden = out.hidden_states[-1][0, -1, :].float().cpu()
+        return logit, out.past_key_values, hidden
 
     @torch.no_grad()
     def _forward_batch_h(self, model, token_ids: list, past_kv
                          ) -> Tuple[torch.Tensor, object, Optional[torch.Tensor]]:
         """Batch KV step: returns (logits, past_kv, last_hidden).
-        Uses a last-layer hook instead of output_hidden_states=True."""
+        Uses output_hidden_states=True and extracts only the final layer."""
         if not token_ids:
             return torch.empty(0), past_kv, None
-        dev = next(model.parameters()).device
-        inp = torch.tensor([token_ids], dtype=torch.long, device=dev)
-        buf, hook = self._grab_last_hidden(model)
-        out = model(input_ids=inp, past_key_values=past_kv, use_cache=True)
-        hook.remove()
+        dev    = next(model.parameters()).device
+        inp    = torch.tensor([token_ids], dtype=torch.long, device=dev)
+        out    = model(input_ids=inp, past_key_values=past_kv, use_cache=True,
+                       output_hidden_states=True)
         logits = out.logits[0].float().cpu()
-        return logits, out.past_key_values, buf['h']
+        hidden = out.hidden_states[-1][0, -1, :].float().cpu()
+        return logits, out.past_key_values, hidden
 
     def _apply_steering(self, t_hidden: torch.Tensor, smoothed_crs: float):
         """Project target hidden state → g_t, scale by CRS risk, set injector."""
@@ -499,14 +487,8 @@ def _extract_target_cache(target, seqs, max_positions: int = 32):
     cache = []  # list of (h [n_pos, t_hidden], p_V [n_pos, vocab], ids)
     for ids in tqdm(seqs, desc="  Extracting target hidden states"):
         with torch.no_grad():
-            # Hook model.norm (final RMSNorm) — outputs plain [batch, seq_len, hidden]
-            # tensor, unambiguous across device_map=auto and attention variants.
-            h_buf = {}
-            hook  = target.model.norm.register_forward_hook(
-                lambda m, inp, out: h_buf.__setitem__('h', out[0].detach().float().cpu()))
-            out   = target(input_ids=ids.to(t_dev))
-            hook.remove()
-            h_all = h_buf['h']                                           # [seq_len, t_hidden]
+            out   = target(input_ids=ids.to(t_dev), output_hidden_states=True)
+            h_all = out.hidden_states[-1][0].float().cpu()               # [seq_len, t_hidden]
             p_all = torch.softmax(out.logits[0].float(), dim=-1).cpu()  # [seq_len, vocab]
         seq_len = h_all.shape[0]
         # Subsample positions evenly to cap memory and compute
