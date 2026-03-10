@@ -1,0 +1,14 @@
+{
+  "deepinception.json": {
+    "n": 40,
+    "sha256": "30b6fb114b88"
+  },
+  "jbb_wrapped.json": {
+    "n": 30,
+    "sha256": "fa8045d51fdc"
+  },
+  "xstest.json": {
+    "n": 30,
+    "sha256": "35097de9cfa2"
+  }
+}
