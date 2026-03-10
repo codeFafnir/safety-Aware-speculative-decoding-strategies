@@ -30,8 +30,7 @@ DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
 os.makedirs(DATA_DIR, exist_ok=True)
 
 # Fixed dataset sizes — change here to regenerate with different sizes
-N_ADVBENCH      = 50
-N_HEXPHF        = 50
+N_ADVBENCH      = 100  # HEx-PHI requires gated HF access; using more AdvBench instead
 N_DEEPINCEPTION = 10
 N_XSTEST        = 30
 
@@ -39,47 +38,80 @@ N_XSTEST        = 30
 # ── Loaders ───────────────────────────────────────────────────────────────────
 
 def load_advbench(n: int) -> List[Dict]:
-    """AdvBench: 500 harmful behaviors from llm-attacks (walledai/AdvBench on HF)."""
+    """AdvBench: 500 harmful behaviors.
+    Primary source: GitHub (no auth). Fallback: walledai/AdvBench on HF.
+    """
     print(f"  Downloading AdvBench (n={n}) ...")
-    from datasets import load_dataset
-    ds = load_dataset("walledai/AdvBench", split="train")
-    data = []
-    for i, x in enumerate(ds):
-        prompt = x.get("prompt", x.get("behavior", x.get("instruction", ""))).strip()
-        if prompt:
-            data.append({"id": f"ab_{i}", "prompt": prompt,
-                         "source": "advbench", "attack_type": "direct"})
-        if len(data) >= n:
-            break
-    print(f"  → {len(data)} prompts")
-    return data
+    import urllib.request, csv, io
+    # GitHub source — publicly available, no auth required
+    url = "https://raw.githubusercontent.com/llm-attacks/llm-attacks/main/data/advbench/harmful_behaviors.csv"
+    try:
+        with urllib.request.urlopen(url, timeout=30) as r:
+            text = r.read().decode("utf-8")
+        reader = csv.DictReader(io.StringIO(text))
+        data = []
+        for i, row in enumerate(reader):
+            prompt = (row.get("goal") or row.get("prompt") or row.get("behavior") or "").strip()
+            if prompt:
+                data.append({"id": f"ab_{i}", "prompt": prompt,
+                             "source": "advbench", "attack_type": "direct"})
+            if len(data) >= n:
+                break
+        if data:
+            print(f"  → {len(data)} prompts (GitHub)")
+            return data
+    except Exception as e:
+        print(f"    GitHub failed ({e}), trying HuggingFace ...")
+    # HF fallback (requires auth)
+    try:
+        from datasets import load_dataset
+        ds = load_dataset("walledai/AdvBench", split="train")
+        data = []
+        for i, x in enumerate(ds):
+            prompt = x.get("prompt", x.get("behavior", x.get("instruction", ""))).strip()
+            if prompt:
+                data.append({"id": f"ab_{i}", "prompt": prompt,
+                             "source": "advbench", "attack_type": "direct"})
+            if len(data) >= n:
+                break
+        print(f"  → {len(data)} prompts (HuggingFace)")
+        return data
+    except Exception as e:
+        print(f"    HuggingFace also failed: {e}")
+    return []
 
 
 def load_hexphf(n: int) -> List[Dict]:
     """HEx-PHI: 330 harmful instructions across 10 categories (LLM-Tuning-Safety/HEx-PHI).
-    Samples evenly from each category for coverage. Category 2 (CSAM) was removed by authors.
+    Tries direct CSV download from HF (no auth for public files), then HF datasets API.
+    Samples evenly across categories. Category 2 (CSAM) removed by dataset authors.
     """
     print(f"  Downloading HEx-PHI (n={n}) ...")
-    from datasets import load_dataset
-    # 10 remaining categories after Category 2 removal
-    categories = [f"category_{i}" for i in [1, 3, 4, 5, 6, 7, 8, 9, 10, 11]]
+    import urllib.request, csv, io
+    categories = [1, 3, 4, 5, 6, 7, 8, 9, 10, 11]
     per_cat = max(1, n // len(categories))
     data = []
-    for cat in categories:
+    for cat_num in categories:
+        url = (f"https://huggingface.co/datasets/LLM-Tuning-Safety/HEx-PHI/resolve/main"
+               f"/category_{cat_num}.csv")
+        cat_data = []
         try:
-            ds = load_dataset("LLM-Tuning-Safety/HEx-PHI", cat, split="train")
-            cat_data = []
-            for x in ds:
-                prompt = x.get("instruction", x.get("prompt", x.get("text", ""))).strip()
+            with urllib.request.urlopen(url, timeout=30) as r:
+                text = r.read().decode("utf-8")
+            reader = csv.DictReader(io.StringIO(text))
+            for row in reader:
+                prompt = (row.get("instruction") or row.get("prompt") or
+                          row.get("text") or "").strip()
                 if prompt:
                     cat_data.append({"id": f"hp_{len(data) + len(cat_data)}",
                                      "prompt": prompt, "source": "hexphf",
-                                     "category": cat, "attack_type": "direct"})
+                                     "category": f"category_{cat_num}",
+                                     "attack_type": "direct"})
                 if len(cat_data) >= per_cat:
                     break
-            data.extend(cat_data)
         except Exception as e:
-            print(f"    skipping {cat}: {e}")
+            print(f"    category_{cat_num} failed: {e}")
+        data.extend(cat_data)
     print(f"  → {len(data)} prompts")
     return data[:n]
 
@@ -184,10 +216,9 @@ def main():
         digest = save(data, fname)
         manifest[fname] = {"n": len(data), "sha256": digest, "source": "hardcoded"}
 
-    # HuggingFace datasets
+    # HuggingFace / GitHub datasets
     for name, loader, n, fname in [
         ("AdvBench", load_advbench, N_ADVBENCH, "advbench.json"),
-        ("HEx-PHI",  load_hexphf,   N_HEXPHF,   "hexphf.json"),
     ]:
         try:
             data = loader(n)

@@ -108,8 +108,9 @@ class Config:
     kl_scale: float = 2.0
 
     # Dataset sizes — aligned with original SSD paper (arXiv 2508.17739)
-    num_advbench:      int = 50   # walledai/AdvBench direct harmful behaviors
-    num_hexphf:        int = 50   # LLM-Tuning-Safety/HEx-PHI (10 categories × 5)
+    # Note: HEx-PHI (330 prompts) requires gated HF access; using AdvBench (500 prompts)
+    # as primary eval, which is the main benchmark in the paper.
+    num_advbench:      int = 100  # walledai/AdvBench direct harmful behaviors
     num_deepinception: int = 10   # nested-narrative jailbreak (hardcoded)
     num_xstest:        int = 30   # benign over-refusal (hardcoded)
 
@@ -180,17 +181,19 @@ def _cache(path, data):
 
 
 def load_advbench(n: int) -> List[Dict]:
-    """AdvBench: 500 direct harmful behaviors (walledai/AdvBench).
-    Used in the original SSD paper as primary harmful eval set.
-    """
+    """AdvBench: 500 direct harmful behaviors. Primary source: GitHub (no auth required)."""
     p = os.path.join(config.data_dir, "advbench.json")
     if os.path.exists(p):
         return json.load(open(p))[:n]
+    import urllib.request, csv, io
+    url = "https://raw.githubusercontent.com/llm-attacks/llm-attacks/main/data/advbench/harmful_behaviors.csv"
     data = []
     try:
-        ds = load_dataset("walledai/AdvBench", split="train")
-        for i, x in enumerate(ds):
-            prompt = x.get("prompt", x.get("behavior", x.get("instruction", ""))).strip()
+        with urllib.request.urlopen(url, timeout=30) as r:
+            text = r.read().decode("utf-8")
+        reader = csv.DictReader(io.StringIO(text))
+        for i, row in enumerate(reader):
+            prompt = (row.get("goal") or row.get("prompt") or row.get("behavior") or "").strip()
             if prompt:
                 data.append({"id": f"ab_{i}", "prompt": prompt,
                              "source": "advbench", "attack_type": "direct"})
@@ -204,28 +207,35 @@ def load_advbench(n: int) -> List[Dict]:
 
 
 def load_hexphf(n: int) -> List[Dict]:
-    """HEx-PHI: 330 harmful instructions across 10 categories (LLM-Tuning-Safety/HEx-PHI).
-    Samples evenly from each category. Used in original SSD paper.
-    """
+    """HEx-PHI: 330 harmful instructions across 10 categories. Direct CSV download from HF."""
     p = os.path.join(config.data_dir, "hexphf.json")
     if os.path.exists(p):
         return json.load(open(p))[:n]
-    categories = [f"category_{i}" for i in [1, 3, 4, 5, 6, 7, 8, 9, 10, 11]]
+    import urllib.request, csv, io
+    categories = [1, 3, 4, 5, 6, 7, 8, 9, 10, 11]
     per_cat = max(1, n // len(categories))
     data = []
-    for cat in categories:
+    for cat_num in categories:
+        url = (f"https://huggingface.co/datasets/LLM-Tuning-Safety/HEx-PHI/resolve/main"
+               f"/category_{cat_num}.csv")
         try:
-            ds = load_dataset("LLM-Tuning-Safety/HEx-PHI", cat, split="train")
-            for x in ds:
-                prompt = x.get("instruction", x.get("prompt", x.get("text", ""))).strip()
+            with urllib.request.urlopen(url, timeout=30) as r:
+                text = r.read().decode("utf-8")
+            reader = csv.DictReader(io.StringIO(text))
+            cat_data = []
+            for row in reader:
+                prompt = (row.get("instruction") or row.get("prompt") or
+                          row.get("text") or "").strip()
                 if prompt:
-                    data.append({"id": f"hp_{len(data)}", "prompt": prompt,
-                                 "source": "hexphf", "category": cat,
-                                 "attack_type": "direct"})
-                if len([d for d in data if d.get("category") == cat]) >= per_cat:
+                    cat_data.append({"id": f"hp_{len(data) + len(cat_data)}",
+                                     "prompt": prompt, "source": "hexphf",
+                                     "category": f"category_{cat_num}",
+                                     "attack_type": "direct"})
+                if len(cat_data) >= per_cat:
                     break
+            data.extend(cat_data)
         except Exception as e:
-            print(f"  HEx-PHI {cat} error: {e}")
+            print(f"  HEx-PHI category_{cat_num} error: {e}")
     if data:
         _cache(p, data)
     return data[:n]
@@ -318,7 +328,6 @@ def build_datasets() -> Tuple[List[Dict], List[Dict]]:
 
     for name, fname, loader, n in [
         ("AdvBench",      "advbench.json",      load_advbench,      config.num_advbench),
-        ("HEx-PHI",       "hexphf.json",        load_hexphf,        config.num_hexphf),
         ("DeepInception", "deepinception.json", load_deepinception, config.num_deepinception),
     ]:
         committed = os.path.join(config.data_dir, fname)
