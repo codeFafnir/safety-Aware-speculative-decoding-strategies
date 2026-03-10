@@ -31,7 +31,7 @@ Usage:
     python ssd_steering.py --phases steering eval --ckpt steering_ckpts/proj.pt
 """
 
-import math, os, json, sys, time
+import gc, math, os, json, sys, time
 from collections import deque
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
@@ -443,6 +443,36 @@ def _build_sequences(tokenizer, n: int, max_len: int, cfg: Config) -> List[torch
     return seqs
 
 
+def _extract_target_cache(target, seqs, max_positions: int = 32):
+    """
+    Phase 1: run target on each sequence, cache last-token hidden state + distribution.
+    Using only the last token per sequence: matches inference usage (we always steer
+    from the most recent verifier context), avoids O(seq_len^2) draft forwards, and
+    fits everything in CPU RAM.
+    max_positions: subsample up to this many positions per sequence for richer signal.
+    """
+    import gc
+    t_dev = next(target.parameters()).device
+    cache = []  # list of (h [n_pos, t_hidden], p_V [n_pos, vocab], ids)
+    for ids in tqdm(seqs, desc="  Extracting target hidden states"):
+        with torch.no_grad():
+            out = target(input_ids=ids.to(t_dev), output_hidden_states=True)
+            h_all  = out.hidden_states[-1][0].float().cpu()  # [seq_len, t_hidden]
+            p_all  = torch.softmax(out.logits[0].float(), dim=-1).cpu()  # [seq_len, vocab]
+        seq_len = h_all.shape[0]
+        # Subsample positions evenly to cap memory and compute
+        if seq_len <= max_positions:
+            idxs = list(range(seq_len))
+        else:
+            step = seq_len // max_positions
+            idxs = list(range(0, seq_len, step))[:max_positions]
+        cache.append((h_all[idxs], p_all[idxs], ids[:, idxs]))
+        del out
+    gc.collect()
+    torch.cuda.empty_cache()
+    return cache
+
+
 def pretrain_projection(
     proj: SteeringProjection,
     draft,
@@ -454,36 +484,42 @@ def pretrain_projection(
     max_seq_len: int = 256,
 ) -> SteeringProjection:
     """
-    Train SteeringProjection using token-level distillation from the verifier,
-    matching the training regime of arXiv:2511.09844.
+    Two-phase training matching arXiv:2511.09844:
 
-    For each token position t in each UltraChat/ShareGPT sequence:
-      1. Run verifier on full sequence → p_V(x_t | x_{1:t-1})  [no grad]
-         Also extract h_t = verifier's last hidden state at position t
-      2. Compute g = proj(h_t)  [grad flows through proj]
-      3. Install hooks: draft MLP += g * scale
-      4. Run draft on x_{1:t} → p_D_steered(x_t | x_{1:t-1})
-      5. Loss = KL(p_V || p_D_steered)  summed over all positions
+    Phase 1 (target only): run target on UltraChat sequences, cache last-token
+      hidden states h_t and distributions p_V to CPU. Target stays frozen, all
+      cached data lives on CPU — no dual-GPU pressure.
 
-    This transfers the verifier's full distribution (including safety behavior)
-    to the steered draft without needing any harmful prompt labels.
+    Phase 2 (draft only): unload target first, then for each cached sequence:
+      g = proj(h_t)                              [grad through proj]
+      inject g * scale into all draft MLP layers
+      draft(ids) → logits at sampled positions
+      Loss = mean KL(p_V || p_D_steered)
+
     Only proj.parameters() are updated.
     """
-    t_dev    = next(target.parameters()).device
-    d_dev    = next(draft.parameters()).device
-    proj_dev = next(proj.parameters()).device
-
-    scale = scfg.base_magnitude * (1.0 + scfg.amplify)  # train at full steering
-
     seqs = _build_sequences(tokenizer, n_sequences, max_seq_len, cfg)
     if not seqs:
-        print("  No training sequences available — skipping pretraining")
+        print("  No training sequences — skipping pretraining")
         return proj
 
-    # Freeze draft and target; only proj trains
+    # ── Phase 1: extract target hidden states to CPU ──────────────────────
+    print(f"  Phase 1: extracting hidden states from {len(seqs)} sequences ...")
+    cache = _extract_target_cache(target, seqs)
+
+    # Unload target to free GPU memory before loading draft computation graph
+    t_dev = next(target.parameters()).device
+    del target
+    gc.collect()
+    torch.cuda.empty_cache()
+    print(f"  Target unloaded — GPU freed for draft training")
+
+    # ── Phase 2: train projection with draft only ─────────────────────────
+    d_dev    = next(draft.parameters()).device
+    proj_dev = next(proj.parameters()).device
+    scale    = scfg.base_magnitude * (1.0 + scfg.amplify)
+
     for p in draft.parameters():
-        p.requires_grad_(False)
-    for p in target.parameters():
         p.requires_grad_(False)
 
     draft_layers = list(getattr(getattr(draft, "model", draft), "layers", []))
@@ -491,79 +527,64 @@ def pretrain_projection(
     proj.train()
     optimizer = torch.optim.AdamW(proj.parameters(), lr=scfg.train_lr)
 
-    print(f"\n  Training on {len(seqs)} sequences, {scfg.train_epochs} epochs ...")
-    print(f"  Objective: KL(p_verifier || p_steered_draft) per token position")
+    print(f"  Phase 2: training projection, {scfg.train_epochs} epochs ...")
+    print(f"  Objective: KL(p_verifier || p_steered_draft) per sampled position")
+
+    def make_hook(g_vec, s):
+        def hook(module, inp, output):
+            gv = g_vec.to(device=output.device, dtype=output.dtype)
+            return output + gv.view(1, 1, -1) * s
+        return hook
 
     for epoch in range(scfg.train_epochs):
-        total_loss = 0.0
         import random
-        random.shuffle(seqs)
+        random.shuffle(cache)
+        total_loss = 0.0
 
-        for step, ids in enumerate(tqdm(seqs, desc=f"  Epoch {epoch+1}")):
-            if ids.shape[1] < 4:
-                continue
+        for h_pos, p_pos, ids_pos in tqdm(cache, desc=f"  Epoch {epoch+1}"):
+            # h_pos: [n_pos, t_hidden]  p_pos: [n_pos, vocab]  ids_pos: [1, n_pos]
             optimizer.zero_grad()
-
-            # ── Verifier pass: get full-sequence logits + hidden states ──
-            with torch.no_grad():
-                t_out = target(input_ids=ids.to(t_dev), output_hidden_states=True)
-                # p_V at each position: [seq_len, vocab]
-                p_V = torch.softmax(t_out.logits[0].float(), dim=-1).cpu()
-                # hidden states at each position: [seq_len, hidden_dim]
-                h_all = t_out.hidden_states[-1][0].float().cpu()  # [seq_len, 3584]
-
-            seq_len = ids.shape[1]
             seq_loss = torch.tensor(0.0, device=proj_dev)
 
-            # Process each token position
-            for t in range(seq_len):
-                # Project verifier hidden state at position t → g_t
-                g_t = proj(h_all[t].to(proj_dev))   # [draft_hidden_dim], has grad
+            for i in range(h_pos.shape[0]):
+                # Project one cached hidden state → g [d_hidden], grad flows
+                g = proj(h_pos[i].to(proj_dev))
 
-                # Install hooks for this position's steering vector
-                def make_hook(g_vec, s):
-                    def hook(module, inp, output):
-                        gv = g_vec.to(device=output.device, dtype=output.dtype)
-                        return output + gv.view(1, 1, -1) * s
-                    return hook
-
+                # Install hooks
                 handles = []
                 for layer in draft_layers:
                     mlp = getattr(layer, "mlp", None)
                     if mlp is not None:
-                        handles.append(mlp.register_forward_hook(make_hook(g_t, scale)))
+                        handles.append(mlp.register_forward_hook(make_hook(g, scale)))
 
-                # Draft forward on tokens up to position t
-                prefix = ids[:, :t + 1]
-                logits_d = draft(input_ids=prefix.to(d_dev)).logits[0, -1, :].float()
+                # Single token forward on the draft at this position
+                tok_id = ids_pos[:, i:i+1]
+                logits_d = draft(input_ids=tok_id.to(d_dev)).logits[0, -1, :].float()
 
                 for h in handles:
                     h.remove()
 
-                # KL(p_V || p_D_steered) at position t
-                # F.kl_div(log_Q, P) = sum(P * (log P - log Q))
-                log_p_d = F.log_softmax(logits_d.to(proj_dev), dim=-1)
-                p_v_t   = p_V[t].to(proj_dev)
-                kl = F.kl_div(log_p_d, p_v_t, reduction="sum")
-                seq_loss = seq_loss + kl / seq_len
+                # KL(p_V || p_D_steered) — truncate vocab mismatch
+                v = min(logits_d.shape[0], p_pos.shape[1])
+                log_p_d = F.log_softmax(logits_d[:v].to(proj_dev), dim=-1)
+                p_v     = p_pos[i, :v].to(proj_dev)
+                p_v     = p_v / p_v.sum()
+                kl = F.kl_div(log_p_d, p_v, reduction="sum")
+                seq_loss = seq_loss + kl / h_pos.shape[0]
 
             seq_loss.backward()
             torch.nn.utils.clip_grad_norm_(proj.parameters(), 1.0)
             optimizer.step()
             total_loss += seq_loss.item()
 
-        avg = total_loss / max(len(seqs), 1)
-        print(f"  Epoch {epoch + 1}/{scfg.train_epochs}  avg_KL={avg:.4f}")
+        avg = total_loss / max(len(cache), 1)
+        print(f"  Epoch {epoch+1}/{scfg.train_epochs}  avg_KL={avg:.4f}")
 
-    # Restore requires_grad
     for p in draft.parameters():
-        p.requires_grad_(True)
-    for p in target.parameters():
         p.requires_grad_(True)
 
     proj.eval()
     return proj
-
 
 # ══════════════════════════════════════════════════════════════════════════════
 # EXPERIMENT RUNNER
@@ -620,14 +641,14 @@ def run_phase_pretrain(n_sequences: int = 500) -> SteeringProjection:
     d_hidden = getattr(draft.config,  "hidden_size", 1536)
     proj = SteeringProjection(t_hidden, d_hidden)
 
+    # target is unloaded inside pretrain_projection after Phase 1 to free GPU
     proj = pretrain_projection(proj, draft, target, tok, config, scfg,
                                n_sequences=n_sequences)
 
     ckpt_path = os.path.join(scfg.ckpt_dir, "proj.pt")
     proj.save(ckpt_path)
 
-    unload(draft)
-    unload(target, tok)
+    unload(draft, tok)
     return proj
 
 
