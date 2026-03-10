@@ -515,8 +515,11 @@ def pretrain_projection(
     print(f"  Target unloaded — GPU freed for draft training")
 
     # ── Phase 2: train projection with draft only ─────────────────────────
-    d_dev    = next(draft.parameters()).device
-    proj_dev = next(proj.parameters()).device
+    # Pin draft to cuda:0 (single GPU, avoids inter-GPU transfers during hooks).
+    # Move proj to cuda:0 too so hook g-vectors never cross the PCIe bus.
+    d_dev    = torch.device("cuda:0") if torch.cuda.device_count() >= 1 else torch.device("cpu")
+    proj_dev = d_dev
+    proj     = proj.to(proj_dev)
     scale    = scfg.base_magnitude * (1.0 + scfg.amplify)
 
     for p in draft.parameters():
@@ -634,8 +637,12 @@ def run_phase_pretrain(n_sequences: int = 500) -> SteeringProjection:
     scfg = SteeringConfig()
     os.makedirs(scfg.ckpt_dir, exist_ok=True)
 
-    draft,  tok = load_model(config.draft_model,  config.use_4bit)
-    target, _   = load_model(config.target_model, config.use_4bit)
+    # Load target on cuda:1 for Phase 1 (hidden state extraction).
+    # Draft goes on cuda:0 for Phase 2. Keeps each model on its own GPU.
+    n_gpu = torch.cuda.device_count()
+    from ssd_experiments import load_model as _load
+    target, _   = _load(config.target_model, config.use_4bit)  # device_map=auto → cuda:1 if free
+    draft,  tok = _load(config.draft_model,  config.use_4bit)  # device_map=auto → cuda:0
 
     t_hidden = getattr(target.config, "hidden_size", 3584)
     d_hidden = getattr(draft.config,  "hidden_size", 1536)
