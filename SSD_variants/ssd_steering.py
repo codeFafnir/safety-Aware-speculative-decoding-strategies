@@ -458,6 +458,34 @@ def _build_sequences(tokenizer, n: int, max_len: int, cfg: Config) -> List[torch
     return seqs
 
 
+def _build_refusal_sequences(tokenizer, harmful_data: List[Dict],
+                              max_seq_len: int, cfg: Config) -> List:
+    """
+    Build input sequences from harmful prompts (prompt-only, no response).
+    Formatted with the target system prompt so the target's one-shot forward
+    produces a logit distribution weighted toward refusal continuations.
+    These sequences are used to train the steering projection toward refusal.
+    """
+    seqs = []
+    for item in harmful_data:
+        prompt = item.get("prompt", "")
+        if not prompt:
+            continue
+        try:
+            text = tokenizer.apply_chat_template(
+                [{"role": "system", "content": cfg.target_system_prompt},
+                 {"role": "user",   "content": prompt}],
+                tokenize=False, add_generation_prompt=True)
+            ids = tokenizer(text, return_tensors="pt",
+                            truncation=True, max_length=max_seq_len)["input_ids"]
+            if ids.shape[1] >= 4:
+                seqs.append(ids)
+        except Exception:
+            pass
+    print(f"  → {len(seqs)} refusal-training sequences from harmful dataset")
+    return seqs
+
+
 def _extract_target_cache(target, seqs, max_positions: int = 32):
     """
     Phase 1: run target on each sequence, cache last-token hidden state + distribution.
@@ -471,9 +499,14 @@ def _extract_target_cache(target, seqs, max_positions: int = 32):
     cache = []  # list of (h [n_pos, t_hidden], p_V [n_pos, vocab], ids)
     for ids in tqdm(seqs, desc="  Extracting target hidden states"):
         with torch.no_grad():
-            out = target(input_ids=ids.to(t_dev), output_hidden_states=True)
-            h_all  = out.hidden_states[-1][0].float().cpu()  # [seq_len, t_hidden]
-            p_all  = torch.softmax(out.logits[0].float(), dim=-1).cpu()  # [seq_len, vocab]
+            # Hook on final layer — avoids materialising all 28 layers of hidden states
+            h_buf = {}
+            hook  = target.model.layers[-1].register_forward_hook(
+                lambda m, inp, out: h_buf.__setitem__('h', out[0][0].detach().float().cpu()))
+            out   = target(input_ids=ids.to(t_dev))
+            hook.remove()
+            h_all = h_buf['h']                                           # [seq_len, t_hidden]
+            p_all = torch.softmax(out.logits[0].float(), dim=-1).cpu()  # [seq_len, vocab]
         seq_len = h_all.shape[0]
         # Subsample positions evenly to cap memory and compute
         if seq_len <= max_positions:
@@ -492,18 +525,15 @@ def pretrain_projection(
     proj: SteeringProjection,
     draft,
     target,
-    tokenizer,
-    cfg: Config,
+    seqs: List,
     scfg: SteeringConfig,
-    n_sequences: int = 500,
-    max_seq_len: int = 256,
 ) -> SteeringProjection:
     """
-    Two-phase training matching arXiv:2511.09844:
+    Two-phase training:
 
-    Phase 1 (target only): run target on UltraChat sequences, cache last-token
-      hidden states h_t and distributions p_V to CPU. Target stays frozen, all
-      cached data lives on CPU — no dual-GPU pressure.
+    Phase 1 (target only): run target on `seqs`, cache last-token hidden states
+      h_t and distributions p_V to CPU. Target stays frozen, all cached data
+      lives on CPU — no dual-GPU pressure.
 
     Phase 2 (draft only): unload target first, then for each cached sequence:
       g = proj(h_t)                              [grad through proj]
@@ -513,7 +543,6 @@ def pretrain_projection(
 
     Only proj.parameters() are updated.
     """
-    seqs = _build_sequences(tokenizer, n_sequences, max_seq_len, cfg)
     if not seqs:
         print("  No training sequences — skipping pretraining")
         return proj
@@ -642,31 +671,41 @@ def run_phase_steering(harmful: List[Dict], benign: List[Dict],
     return results_h, results_b
 
 
-def run_phase_pretrain(n_sequences: int = 500) -> SteeringProjection:
+def run_phase_pretrain(harmful_data: List[Dict],
+                       max_seq_len: int = 512) -> SteeringProjection:
+    """
+    Train the steering projection on harmful-prompt refusal data.
+
+    The target model sees each harmful prompt and produces a refusal-weighted
+    logit distribution (it refuses most of these prompts). We train the
+    projection so the steered draft mirrors that refusal distribution.
+
+    This replaces the original UltraChat_200k distillation, which taught the
+    draft to be MORE helpful — the opposite of what we need on harmful prompts.
+    """
     print("\n" + "=" * 60)
-    print("PHASE: PRETRAIN STEERING PROJECTION  (UltraChat_200k distillation)")
+    print("PHASE: PRETRAIN STEERING PROJECTION  (refusal distillation)")
     print("=" * 60)
 
     scfg = SteeringConfig()
     os.makedirs(scfg.ckpt_dir, exist_ok=True)
 
-    # Load target on cuda:1 for Phase 1 (hidden state extraction).
-    # Draft goes on cuda:0 for Phase 2. Keeps each model on its own GPU.
-    n_gpu = torch.cuda.device_count()
     from ssd_experiments import load_model as _load
-    target, _   = _load(config.target_model, config.use_4bit)  # device_map=auto → cuda:1 if free
-    draft,  tok = _load(config.draft_model,  config.use_4bit)  # device_map=auto → cuda:0
+    target, _   = _load(config.target_model, config.use_4bit)
+    draft,  tok = _load(config.draft_model,  config.use_4bit)
+
+    seqs = _build_refusal_sequences(tok, harmful_data, max_seq_len, config)
 
     t_hidden = getattr(target.config, "hidden_size", 3584)
     d_hidden = getattr(draft.config,  "hidden_size", 1536)
     proj = SteeringProjection(t_hidden, d_hidden)
 
     # target is unloaded inside pretrain_projection after Phase 1 to free GPU
-    proj = pretrain_projection(proj, draft, target, tok, config, scfg,
-                               n_sequences=n_sequences)
+    proj = pretrain_projection(proj, draft, target, seqs, scfg)
 
-    ckpt_path = os.path.join(scfg.ckpt_dir, "proj.pt")
+    ckpt_path = os.path.join(scfg.ckpt_dir, "proj_refusal.pt")
     proj.save(ckpt_path)
+    print(f"  Checkpoint saved → {ckpt_path}")
 
     unload(draft, tok)
     return proj
@@ -717,8 +756,8 @@ def main():
     parser.add_argument("--base_magnitude", type=float, default=0.05)
     parser.add_argument("--amplify",        type=float, default=2.0)
     parser.add_argument("--layer_frac",     type=float, default=1.0)
-    parser.add_argument("--n_sequences",    type=int,   default=500,
-                        help="Number of UltraChat sequences for pretraining")
+    parser.add_argument("--max_seq_len",    type=int,   default=512,
+                        help="Max token length for refusal training sequences")
     args = parser.parse_args()
 
     if args.no_4bit:
@@ -736,7 +775,7 @@ def main():
         proj = SteeringProjection.load(args.ckpt, target_hidden=3584, draft_hidden=1536)
 
     if run_all or "pretrain" in phases:
-        proj = run_phase_pretrain(n_sequences=args.n_sequences)
+        proj = run_phase_pretrain(harmful, max_seq_len=args.max_seq_len)
 
     if run_all or "steering" in phases:
         run_phase_steering(harmful, benign, proj=proj)
