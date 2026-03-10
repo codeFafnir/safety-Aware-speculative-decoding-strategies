@@ -582,8 +582,7 @@ def pretrain_projection(
         avg = total_loss / max(len(cache), 1)
         print(f"  Epoch {epoch+1}/{scfg.train_epochs}  avg_KL={avg:.4f}")
 
-    for p in draft.parameters():
-        p.requires_grad_(True)
+    # No need to restore requires_grad — draft is unloaded by caller immediately after.
 
     proj.eval()
     return proj
