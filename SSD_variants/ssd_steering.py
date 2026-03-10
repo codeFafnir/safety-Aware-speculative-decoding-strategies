@@ -45,7 +45,7 @@ from tqdm.auto import tqdm
 # ── Import base classes from sibling module ───────────────────────────────────
 sys.path.insert(0, os.path.dirname(__file__))
 from ssd_experiments import (
-    Config, SSDDecoderCRS, load_model, unload,
+    Config, SSDDecoder, SSDDecoderCRS, load_model, unload,
     save_responses, load_responses, evaluate, Qwen3Guard,
     build_datasets, config, print_results,
 )
@@ -394,6 +394,174 @@ class SSDDecoderSteering(SSDDecoderCRS):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# STEERING-ONLY DECODER  (vanilla SSD matching + steering, no CRS)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class SSDDecoderSteeringOnly(SSDDecoder):
+    """
+    Vanilla SSD matching (binary match-ratio, bin=7) + hidden-state steering.
+
+    Identical to SSDDecoderSteering except:
+      - Token selection uses the base SSD binary match-ratio mode switch
+        (not CRS per-step switching).
+      - Steering magnitude is fixed at base_magnitude (amplify has no effect
+        since there is no CRS score to modulate it).
+
+    Useful for ablation: isolates the contribution of steering injection
+    from the contribution of CRS-based mode switching.
+    """
+
+    def __init__(self, draft, target, tokenizer, cfg: Config,
+                 scfg: SteeringConfig,
+                 proj: Optional[SteeringProjection] = None):
+        super().__init__(draft, target, tokenizer, cfg)
+        self.scfg = scfg
+
+        t_hidden = getattr(target.config, "hidden_size", 3584)
+        d_hidden = getattr(draft.config,  "hidden_size", 1536)
+        print(f"  Steering dims: target={t_hidden}, draft={d_hidden}")
+
+        self.proj = proj if proj is not None else SteeringProjection(t_hidden, d_hidden)
+        self.proj.eval()
+        self.injector = SteeringInjector(draft, scfg.layer_frac)
+
+    # ── Reuse hidden-state helpers from SSDDecoderSteering ─────────────────
+    _init_kv_h      = SSDDecoderSteering._init_kv_h
+    _forward_batch_h = SSDDecoderSteering._forward_batch_h
+    _apply_steering  = SSDDecoderSteering._apply_steering
+
+    @torch.no_grad()
+    def generate(self, user_msg: str, max_new_tokens: int = 256) -> Tuple[str, float, Dict]:
+        draft_prompt = self.tok.apply_chat_template(
+            [{"role": "system", "content": self.cfg.draft_system_prompt},
+             {"role": "user",   "content": user_msg}],
+            tokenize=False, add_generation_prompt=True)
+        target_prompt = self.tok.apply_chat_template(
+            [{"role": "system", "content": self.cfg.target_system_prompt},
+             {"role": "user",   "content": user_msg}],
+            tokenize=False, add_generation_prompt=True)
+
+        d_ids = self.tok(draft_prompt,  return_tensors="pt")["input_ids"]
+        t_ids = self.tok(target_prompt, return_tensors="pt")["input_ids"]
+
+        forced_union = False
+        if self.cfg.use_ppl_gate:
+            ppl = self._prompt_ppl(d_ids)
+            forced_union = ppl > self.cfg.ppl_threshold
+
+        mode      = 2 if forced_union else 1
+        threshold = self.cfg.beta_0
+        alpha_I   = self.cfg.alpha_I
+        C         = self.cfg.sample_space_c
+        T         = self.cfg.lookahead_T
+        b         = self.cfg.bin_size_b
+
+        match_log = []
+        generated = []
+        union_tok = inter_tok = mode_sw = 0
+        t0 = time.time()
+
+        # Init KV — target also returns hidden state for first steering vector
+        d_last_logits, d_kv = self._init_kv(self.draft, d_ids)
+        t_last_logits, t_kv, t_hidden = self._init_kv_h(self.target, t_ids)
+
+        # Fixed-magnitude initial steering (no CRS → always 0.0 for amplify term)
+        self._apply_steering(t_hidden, 0.0)
+
+        steps = 0
+        while steps < max_new_tokens:
+            # Draft T tokens greedily
+            expert_draft_probs  = [torch.softmax(d_last_logits, dim=-1)]
+            expert_draft_tokens = [int(torch.argmax(d_last_logits).item())]
+            d_kv_rolling = d_kv
+            for i in range(1, T):
+                logit_i, d_kv_rolling = self._forward_one(
+                    self.draft, expert_draft_tokens[i - 1], d_kv_rolling)
+                expert_draft_probs.append(torch.softmax(logit_i, dim=-1))
+                expert_draft_tokens.append(int(torch.argmax(logit_i).item()))
+
+            # Verify: target scores T positions
+            base_probs = [torch.softmax(t_last_logits, dim=-1)]
+            if T > 1:
+                batch_logits, _ = self._forward_batch(
+                    self.target, expert_draft_tokens[:-1], t_kv)
+                for j in range(T - 1):
+                    base_probs.append(torch.softmax(batch_logits[j], dim=-1))
+
+            # Accept/reject with vanilla SSD binary mode switch
+            accepted_this_step = []
+            for i in range(T):
+                if steps >= max_new_tokens:
+                    break
+                p_base        = base_probs[i]
+                p_expert      = expert_draft_probs[i]
+                expert_greedy = expert_draft_tokens[i]
+
+                if mode == 1:
+                    selected = self._select_intersection(p_base, p_expert, C, alpha_I)
+                    inter_tok += 1
+                else:
+                    selected = self._select_union(p_base, p_expert, C, self.cfg.alpha_U)
+                    union_tok += 1
+
+                matched = int(selected == expert_greedy)
+                match_log.append(matched)
+                accepted_this_step.append(selected)
+                steps += 1
+
+                if selected == self.tok.eos_token_id:
+                    break
+                if not matched:
+                    break
+
+            # Update KV caches + refresh steering vector
+            if accepted_this_step:
+                draft_batch, d_kv = self._forward_batch(
+                    self.draft, accepted_this_step, d_kv)
+                d_last_logits = draft_batch[-1]
+
+                target_batch, t_kv, t_hidden = self._forward_batch_h(
+                    self.target, accepted_this_step, t_kv)
+                t_last_logits = target_batch[-1]
+
+                # Fixed magnitude — no CRS score available
+                self._apply_steering(t_hidden, 0.0)
+
+                generated.extend(accepted_this_step)
+
+            if generated and generated[-1] == self.tok.eos_token_id:
+                break
+
+            # Binary mode switch every b tokens (vanilla SSD logic)
+            if len(match_log) >= b and len(match_log) % b == 0:
+                window = match_log[-b:]
+                match_ratio = sum(window) / b
+                new_mode = 1 if match_ratio >= threshold else 2
+                if new_mode != mode:
+                    mode_sw += 1
+                mode = new_mode
+                threshold, alpha_I = self._anneal(new_mode == mode, mode, threshold, alpha_I)
+
+        self.injector.off()
+
+        latency = time.time() - t0
+        text = self.tok.decode(generated, skip_special_tokens=True).strip()
+        mr = sum(match_log) / len(match_log) if match_log else 1.0
+        return text, latency, {
+            "match_ratio":         mr,
+            "union_tokens":        union_tok,
+            "intersection_tokens": inter_tok,
+            "mode_switches":       mode_sw,
+            "forced_union_by_ppl": forced_union,
+            "total_steps":         len(generated),
+        }
+
+    def __del__(self):
+        if hasattr(self, "injector"):
+            self.injector.remove()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # PRETRAIN THE PROJECTION  (matching original paper's training regime)
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -662,6 +830,42 @@ def run_phase_steering(harmful: List[Dict], benign: List[Dict],
     return results_h, results_b
 
 
+def run_phase_steering_only(harmful: List[Dict], benign: List[Dict],
+                            proj: Optional[SteeringProjection] = None):
+    """Vanilla SSD matching + steering injection, no CRS."""
+    print("\n" + "=" * 60)
+    print("PHASE: VANILLA SSD + STEERING ONLY (no CRS)")
+    print("=" * 60)
+
+    scfg = SteeringConfig()
+
+    draft,  tok = load_model(config.draft_model,  config.use_4bit)
+    target, _   = load_model(config.target_model, config.use_4bit)
+
+    decoder = SSDDecoderSteeringOnly(draft, target, tok, config, scfg, proj)
+
+    h_path = os.path.join(config.responses_dir, "ssd_steering_only_harmful.json")
+    b_path = os.path.join(config.responses_dir, "ssd_steering_only_benign.json")
+    results_h, results_b = [], []
+    for item in tqdm(harmful, desc="ssd_steering_only harmful"):
+        resp, lat, stats = decoder.generate(item["prompt"], config.max_new_tokens)
+        results_h.append({**item, "response": resp, "latency": lat,
+                          "method": "ssd_steering_only", **stats})
+        save_responses(results_h, h_path)
+
+    for item in tqdm(benign, desc="ssd_steering_only benign"):
+        resp, lat, stats = decoder.generate(item["prompt"], config.max_new_tokens)
+        results_b.append({**item, "response": resp, "latency": lat,
+                          "method": "ssd_steering_only", **stats})
+        save_responses(results_b, b_path)
+
+    decoder.injector.remove()
+    unload(draft)
+    unload(target, tok)
+
+    return results_h, results_b
+
+
 def run_phase_pretrain(harmful_data: List[Dict],
                        max_seq_len: int = 512) -> SteeringProjection:
     """
@@ -711,7 +915,7 @@ def run_evaluation_steering():
     guard.load()
 
     all_metrics = {}
-    for method in ("vanilla", "ssd", "ssd_crs", "ssd_steering"):
+    for method in ("vanilla", "ssd", "ssd_crs", "ssd_steering", "ssd_steering_only"):
         h_path = os.path.join(config.responses_dir, f"{method}_harmful.json")
         b_path = os.path.join(config.responses_dir, f"{method}_benign.json")
         if not os.path.exists(h_path) or not os.path.exists(b_path):
@@ -738,7 +942,7 @@ def main():
     import argparse
     parser = argparse.ArgumentParser(description="SSD-Steering experiments")
     parser.add_argument("--phases", nargs="+",
-                        choices=["pretrain", "steering", "eval", "all"],
+                        choices=["pretrain", "steering", "steering_only", "eval", "all"],
                         default=["steering", "eval"])
     parser.add_argument("--ckpt",  type=str, default=None,
                         help="Path to a pre-trained steering projection checkpoint")
@@ -770,6 +974,9 @@ def main():
 
     if run_all or "steering" in phases:
         run_phase_steering(harmful, benign, proj=proj)
+
+    if run_all or "steering_only" in phases:
+        run_phase_steering_only(harmful, benign, proj=proj)
 
     if run_all or "eval" in phases:
         metrics = run_evaluation_steering()
