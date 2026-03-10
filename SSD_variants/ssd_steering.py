@@ -208,28 +208,43 @@ class SSDDecoderSteering(SSDDecoderCRS):
 
     # ── KV helpers that also return hidden states ──────────────────────────
 
+    @staticmethod
+    def _grab_last_hidden(model) -> Tuple[dict, object]:
+        """Register a one-shot hook on the final transformer layer to capture
+        the last-token hidden state without output_hidden_states=True (which
+        stores all 28 layers — ~27x more memory than we need)."""
+        buf = {}
+        last_layer = model.model.layers[-1]
+        hook = last_layer.register_forward_hook(
+            lambda m, inp, out: buf.__setitem__('h', out[0][0, -1, :].detach().float().cpu())
+        )
+        return buf, hook
+
     @torch.no_grad()
     def _init_kv_h(self, model, ids) -> Tuple[torch.Tensor, object, torch.Tensor]:
-        """Full forward pass: returns (last_logit, past_kv, last_hidden)."""
+        """Full forward pass: returns (last_logit, past_kv, last_hidden).
+        Uses a last-layer hook instead of output_hidden_states=True."""
         dev = next(model.parameters()).device
-        out = model(input_ids=ids.to(dev), use_cache=True, output_hidden_states=True)
+        buf, hook = self._grab_last_hidden(model)
+        out = model(input_ids=ids.to(dev), use_cache=True)
+        hook.remove()
         logit  = out.logits[0, -1, :].float().cpu()
-        hidden = out.hidden_states[-1][0, -1, :].float().cpu()
-        return logit, out.past_key_values, hidden
+        return logit, out.past_key_values, buf['h']
 
     @torch.no_grad()
     def _forward_batch_h(self, model, token_ids: list, past_kv
                          ) -> Tuple[torch.Tensor, object, Optional[torch.Tensor]]:
-        """Batch KV step: returns (logits, past_kv, last_hidden)."""
+        """Batch KV step: returns (logits, past_kv, last_hidden).
+        Uses a last-layer hook instead of output_hidden_states=True."""
         if not token_ids:
             return torch.empty(0), past_kv, None
         dev = next(model.parameters()).device
         inp = torch.tensor([token_ids], dtype=torch.long, device=dev)
-        out = model(input_ids=inp, past_key_values=past_kv, use_cache=True,
-                    output_hidden_states=True)
+        buf, hook = self._grab_last_hidden(model)
+        out = model(input_ids=inp, past_key_values=past_kv, use_cache=True)
+        hook.remove()
         logits = out.logits[0].float().cpu()
-        hidden = out.hidden_states[-1][0, -1, :].float().cpu()
-        return logits, out.past_key_values, hidden
+        return logits, out.past_key_values, buf['h']
 
     def _apply_steering(self, t_hidden: torch.Tensor, smoothed_crs: float):
         """Project target hidden state → g_t, scale by CRS risk, set injector."""
