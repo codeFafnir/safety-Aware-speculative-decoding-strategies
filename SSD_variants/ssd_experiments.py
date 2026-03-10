@@ -60,10 +60,10 @@ class Config:
     # ── SSD baseline hyperparameters (paper Appendix B.1) ─────────────────
     sample_space_c: int   = 10    # top-c token set size
     kappa:          int   = 2     # top-κ check for intersection fallback
-    lookahead_T:    int   = 3     # (unused in token-level impl; kept for reference)
+    lookahead_T:    int   = 3     # speculative window size T (paper: num_speculate_tokens=3)
     bin_size_b:     int   = 7     # bin length for match ratio computation
-    alpha_I:        float = 0.3   # draft blend strength in intersection mode
-    alpha_U:        float = 0.8   # draft blend strength in union mode
+    alpha_I:        float = 0.5   # draft blend strength in intersection mode (paper default: 0.5)
+    alpha_U:        float = 0.5   # draft blend strength in union mode (paper default: 0.5)
     beta_0:         float = 0.6   # initial match ratio threshold
     beta_decay:     float = 0.1   # threshold decay per unchanged bin
     alpha_I_min:    float = 0.3
