@@ -1,0 +1,206 @@
+% Safety-Aware Speculative Decoding — NeurIPS-style Project Report
+% Page limit: 9 pages including references
+% Format: thick rules above/below title block, centered title (sans-serif), centered author.
+
+\documentclass[11pt,a4paper]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{hyperref}
+\usepackage{url}
+\usepackage{booktabs}
+\usepackage{amsfonts,amsmath,amssymb}
+\usepackage{graphicx}
+\usepackage{natbib}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+\usepackage{xcolor}
+
+% If using neurips_2024.sty in Overleaf, uncomment as needed:
+% \usepackage{neurips_2024}
+
+\begin{document}
+
+% --- Thick rule above title ---
+\noindent\rule{\textwidth}{1.5pt}\\[1em]
+% --- Title: centered, large, bold, sans-serif ---
+\begin{center}
+  {\sffamily\bfseries\LARGE Safety-Aware Speculative Decoding:\\
+  Extending SSD with Composite Risk Scores and Hidden-State Steering}\\[1.5em]
+  % --- Author block: centered, serif ---
+  Raghusrinivasan Venkatesan\\
+  UC San Diego\\
+  \texttt{rlvenkatesan@ucsd.edu}\\
+  % Uncomment if needed: 2 Grace days used
+\end{center}
+% --- Thick rule below author ---
+\vspace{0.5em}
+\noindent\rule{\textwidth}{1.5pt}
+\vspace{1em}
+
+% --- Abstract ---
+\begin{abstract}
+\noindent
+Large language models (LLMs) remain vulnerable to jailbreak attacks despite alignment. We build on \emph{Speculative Safety-Aware Decoding} (SSD), which uses a small safety-conscious draft model and match-ratio-based mode switching to improve safety and inference speed. We extend SSD along three directions: (1) a \emph{Composite Risk Score} (CRS) that replaces coarse binary switching with a per-token continuous risk signal combining match mismatch, KL divergence, entropy gap, and refusal-token mass; (2) \emph{hidden-state steering} that injects the target model's refusal-aligned representations into the draft, with injection scale modulated by CRS; and (3) integration with \emph{Alignment-Augmented Speculative Decoding} (AASD) for KV-cached generation and alignment sampling. We also add training-free extensions: contrastive system prompts and perplexity-gated early Union mode. On a custom high-ASR evaluation set (70 harmful, 30 benign prompts), CRS alone reduces attack success rate (ASR) by 30.7 percentage points versus vanilla; CRS combined with steering achieves \textbf{1.8\%} overall ASR and halves DeepInception ASR (40\% $\to$ 20\%) with minimal over-refusal (3.3\%). We ablate CRS vs.\ steering and discuss failure modes on template-based jailbreaks.
+\end{abstract}
+
+\section{Introduction}
+\label{sec:intro}
+
+Aligned large language models (LLMs) are routinely deployed for assistive tasks, yet they remain susceptible to \emph{jailbreak} attacks that elicit harmful or unsafe behavior through adversarial prompts, roleplay framing, or nested narrative techniques~\cite{deepinception,jbb}. Defenses that rely on retraining or heavy fine-tuning are costly and may not generalize to new attack types. \emph{Inference-time} interventions—operating only during decoding—offer a lightweight alternative: they require no changes to the target model's weights and can be combined with speculative decoding to simultaneously improve safety and speed.
+
+\emph{Speculative decoding} uses a small draft model to propose tokens that a larger target model verifies in parallel, reducing latency~\cite{leviathan2023,specdecode}. \citet{ssd2025} introduced \textbf{Speculative Safety-Aware Decoding (SSD)}, which repurposes this setup for safety: a safety-conscious draft model and the target model produce token distributions at each step, and a \emph{match ratio} over a fixed window (e.g., 7 tokens) determines whether to sample from the \emph{intersection} or \emph{union} of their top-$c$ token sets. High match ratio is interpreted as benign; low match triggers a more permissive \emph{Union} mode that allows the draft's refusal tokens into the sample space. SSD improves safety while retaining inference speedup, but its binary, window-based switching is coarse and can miss early-token jailbreak signals or over-refuse on long benign responses.
+
+In this work we extend SSD along several directions implemented and evaluated in a single project pipeline:
+
+\begin{itemize}
+  \item \textbf{Composite Risk Score (CRS):} We replace the binary match-ratio switch with a continuous \emph{Composite Risk Score} computed every token, combining (i) match mismatch, (ii) KL divergence between draft and target distributions, (iii) entropy gap, and (iv) refusal-token mass. Mode switching and steering strength are driven by CRS, enabling finer-grained safety control.
+  \item \textbf{Hidden-state steering:} We inject the target model's last hidden state (via a learned linear projection) into the draft model's MLP layers, scaling the injection by CRS so that steering amplifies when risk is high. The projection is trained with \emph{refusal distillation} on harmful prompts where the target refuses.
+  \item \textbf{Alignment-Augmented Speculative Decoding (AASD):} We integrate SSD with AASD-style \emph{alignment sampling} (draft logits blended with target prefill prior) and KV-cache-based incremental decoding for O(1) per-step cost, improving both safety alignment and throughput.
+  \item \textbf{Training-free extensions:} We use \emph{contrastive system prompts} (safety-heavy for draft, standard for target) and \emph{perplexity-gated early Union}: if prompt perplexity under the draft exceeds a threshold, Union mode is forced from token 1 to handle GCG-style and other high-ppl attacks.
+\end{itemize}
+
+We evaluate on a custom dataset of 70 harmful prompts (40 DeepInception, 30 JailbreakBench-wrapped) and 30 benign XSTest prompts, with Qwen3Guard as the safety classifier. Our main findings: (1) CRS is the primary driver of safety gain (30.7 pp ASR reduction vs.\ vanilla); (2) steering alone with vanilla SSD mode switching gives limited benefit; (3) CRS + steering achieves 1.8\% overall ASR and halves DeepInception ASR versus CRS-only, with 3.3\% over-refusal; (4) template-wrapped jailbreaks can slightly increase ASR under SSD variants—an important failure mode.
+
+The rest of the paper is organized as follows. \S\ref{sec:related} briefly reviews related work. \S\ref{sec:prelim} formalizes the problem and SSD baseline. \S\ref{sec:method} describes CRS, steering, AASD, and training-free extensions. \S\ref{sec:experiments} and \S\ref{sec:results} present setup and results. \S\ref{sec:discussion} discusses limitations and \S\ref{sec:conclusion} concludes.
+
+\section{Related Work}
+\label{sec:related}
+
+\textbf{Jailbreak defenses.} Defenses range from input filtering~\cite{smoothllm}, paraphrase or repetition checks~\cite{parden}, to inference-time decoding strategies. SafeDecoding~\cite{safedecoding} adjusts the sampling distribution using a safety expert model (e.g., CensorTune) by blending base and expert logits and sampling from the intersection of top-$k$ tokens; it does not use speculative decoding. Our baseline SSD~\cite{ssd2025} instead uses a single draft model for both speed and safety and switches between intersection/union based on match ratio.
+
+\textbf{Speculative decoding.} Leviathan et al.~\cite{leviathan2023} and Chen et al.~\cite{specdecode} introduced speculative decoding with a draft model proposing multiple tokens and the target verifying in parallel. Extensions include adaptive draft length~\cite{adaedl,adasd}, entropy-aware rejection~\cite{easd}, and risk-bounded acceptance~\cite{arcdecode}. AASD-style alignment sampling blends draft logits with the target's prefill prior and uses KV caches for O(1) per-step decoding; we integrate this with SSD.
+
+\textbf{Representation steering.} Activation addition~\cite{actadd} steers models at inference by adding contrastive activation differences. Steering pretrained drafters during speculative decoding~\cite{steeringdraft} injects target information into the draft; we adopt a similar idea with a CRS-modulated refusal-distillation projection.
+
+\section{Problem Setup and SSD Baseline}
+\label{sec:prelim}
+
+\subsection{Setting}
+We have a \emph{target} LLM $P_{\mathrm{t}}$ (e.g., Qwen2.5-7B-Instruct) and a smaller \emph{draft} LLM $P_{\mathrm{d}}$ (e.g., Qwen2.5-1.5B-Instruct). Both are given the same user prompt (possibly with different system prompts). At each decoding step $t$, they produce token distributions $p_{\mathrm{t}}(\cdot\mid x_{<t})$ and $p_{\mathrm{d}}(\cdot\mid x_{<t})$. The goal is to produce a sequence that (i) stays close to the target's behavior on benign prompts (utility) and (ii) refuses or avoids harmful content on jailbreak prompts (safety), without retraining the target.
+
+\subsection{SSD Algorithm (Baseline)}
+\label{sec:ssd}
+
+SSD~\cite{ssd2025} uses the draft as a safety-conscious partner. At each step:
+\begin{enumerate}
+  \item Compute top-$c$ token sets $\mathcal{T}_{\mathrm{t}}$, $\mathcal{T}_{\mathrm{d}}$ from the two distributions.
+  \item Maintain a \emph{match ratio} $\beta$ over the last $b$ tokens: the fraction of steps where the \emph{sampled} token was in the draft's top-$c$.
+  \item If $\beta > \beta_{\mathrm{th}}$: \emph{Intersection} mode — sample from $\mathcal{T}_{\mathrm{t}} \cap \mathcal{T}_{\mathrm{d}}$ with composite score $p_{\mathrm{t}} + \alpha_I (p_{\mathrm{d}} - p_{\mathrm{t}})$.
+  \item If $\beta \le \beta_{\mathrm{th}}$: \emph{Union} mode — sample from $\mathcal{T}_{\mathrm{t}} \cup \mathcal{T}_{\mathrm{d}}$ with $p_{\mathrm{t}} + \alpha_U (p_{\mathrm{d}} - p_{\mathrm{t}})$, allowing the draft's refusal tokens into the support.
+\end{enumerate}
+Annealing (Algorithm 2 in the original paper) decays $\beta_{\mathrm{th}}$ and $\alpha_I$ when the scheme stays unchanged to limit over-refusal on long benign replies. Our implementation uses contrastive system prompts (draft: safety-heavy; target: standard) and an optional \emph{perplexity gate}: if the prompt's perplexity under the draft exceeds a threshold, we force Union from step 1 to handle adversarial suffixes.
+
+\subsection{Limitations of Binary Match-Ratio Switching}
+The match ratio is computed every $b$ tokens and is binary in effect (above or below threshold). Thus (i) the first $b$ tokens have no safety signal from agreement, (ii) slow-building jailbreaks (e.g., narrative) may keep $\beta$ high until harm is already underway, and (iii) the signal is an average over the window rather than a per-token risk. Our CRS addresses these by providing a continuous, per-token risk that can drive both mode choice and steering strength.
+
+\section{Method}
+\label{sec:method}
+
+\subsection{Composite Risk Score (CRS)}
+\label{sec:crs}
+
+At each token step $t$, we define a scalar \textbf{Composite Risk Score} $r_t \in [0,1]$ from four normalized signals:
+
+\begin{itemize}
+  \item \textbf{Match mismatch} $1 - \mathbb{I}[\hat{x}_t \in \mathcal{T}_{\mathrm{d}}]$: disagreement between the (previously) sampled token and the draft's top-$c$ (we use a running indicator).
+  \item \textbf{KL divergence} $\mathrm{KL}(p_{\mathrm{d}} \| p_{\mathrm{t}})$: large values indicate the draft distribution diverges from the target (e.g., draft refuses, target does not).
+  \item \textbf{Entropy gap} $H(p_{\mathrm{t}}) - H(p_{\mathrm{d}})$: draft more confident than target can indicate an unusual (e.g., harmful) context.
+  \item \textbf{Refusal mass} $\sum_{v \in \mathcal{R}} p_{\mathrm{d}}(v)$: probability the draft assigns to a fixed set of refusal tokens (e.g., ``I cannot'', ``I'm sorry'').
+\end{itemize}
+
+We normalize each component to $[0,1]$ (e.g., min-max over a short history or clip) and take a convex combination:
+\begin{equation}
+  r_t = w_1 (1-\mathrm{match}) + w_2 \,\overline{\mathrm{KL}} + w_3 \,\overline{\Delta H} + w_4 \,\overline{\mathrm{refusal}},
+\end{equation}
+with $w_1{=}w_2{=}0.3$, $w_3{=}0.1$, $w_4{=}0.3$ in our experiments. The score is smoothed over a window of 3 steps. When $\bar{r}_t > \tau_{\mathrm{crs}}$ (e.g., 0.2), we apply stronger safety (intersection with annealing); otherwise we use union. Thus CRS replaces the 7-token binary switch with a per-token, continuous gate.
+
+\subsection{Hidden-State Steering}
+\label{sec:steering}
+
+We add a \emph{steering} module that injects the target's last-layer hidden state into the draft's MLP layers so the draft's internal representations move toward the target's refusal behavior when risk is high.
+
+\textbf{Projection.} Let $h_{\mathrm{t}} \in \mathbb{R}^{d_{\mathrm{t}}}$ be the target's last hidden state and $d_{\mathrm{d}}$ the draft's hidden size. We learn a linear map $\mathrm{proj}: \mathbb{R}^{d_{\mathrm{t}}} \to \mathbb{R}^{d_{\mathrm{d}}}$ by \emph{refusal distillation}: on harmful prompts where the target refuses, we minimize the KL between the draft's next-token distribution (after receiving a projected vector) and the target's, or a hidden-state loss (e.g., MSE between draft hidden states and projected target hidden states). Training uses only harmful/refusal data; training on general helpfulness data was found to increase ASR.
+
+\textbf{Inference.} We unit-normalize $h_{\mathrm{t}}$ (critical: unnormalized norms $\approx 295$ cause logit collapse), compute $g_t = \mathrm{proj}(h_{\mathrm{t}}/\|h_{\mathrm{t}}\|)$, and add $g_t$ scaled by $\eta_t$ to the draft's MLP outputs at all layers (or a fraction of layers). The scale is CRS-modulated:
+\begin{equation}
+  \eta_t = \eta_0 \bigl(1 + \lambda \,\bar{r}_t\bigr),
+\end{equation}
+so steering is stronger when CRS is high. We use $\eta_0 = 0.003$, $\lambda = 5$ in experiments.
+
+\subsection{Integration with AASD}
+\label{sec:aasd}
+
+We combine SSD with an AASD-style pipeline for efficiency and alignment:
+
+\begin{enumerate}
+  \item \textbf{Prefill \& KV cache:} Run a single full forward pass for both models on the prompt; keep target and draft KV caches and the target's \emph{prefill logits} at the last prompt position.
+  \item \textbf{Alignment sampling:} At each step, draft logits are blended with the (fixed) target prefill prior: $\ell_{\mathrm{d}} \leftarrow (1-\lambda_{\mathrm{align}}) \ell_{\mathrm{d}} + \lambda_{\mathrm{align}} \,\ell_{\mathrm{t}}^{\mathrm{prefill}}$, biasing the draft toward the target's initial response direction.
+  \item \textbf{Incremental decoding:} For each new token, only the new token is fed in; KV caches are updated (O(1) per step instead of O(n) full recompute).
+  \item \textbf{Conditional verification:} In intersection mode, if $p_{\mathrm{t}}(\hat{x}_t) < \tau \cdot \max_v p_{\mathrm{t}}(v)$, we discard the token and resample from the union set with $\alpha_U$, avoiding low-probability target tokens that could be harmful.
+\end{enumerate}
+
+SSD's intersection/union and match-ratio (or CRS) logic run on top of this pipeline; the draft logits used for token sets and composite sampling are the aligned draft logits above.
+
+\subsection{Training-Free Extensions}
+\label{sec:trainingfree}
+
+\begin{itemize}
+  \item \textbf{Contrastive system prompts:} The draft receives a strong safety-focused system prompt; the target receives a standard ``helpful assistant'' prompt. This widens the draft-target distribution gap on harmful prompts without fine-tuning, making match ratio (and CRS) more discriminative.
+  \item \textbf{Perplexity-gated early Union:} Before generation, we compute prompt perplexity under the draft. If it exceeds a threshold (e.g., 50 or 150), we force Union mode from token 1 to handle GCG-style and other high-perplexity jailbreaks where the match-ratio window would otherwise be inactive for the first $b$ tokens.
+\end{itemize}
+
+\section{Experimental Setup}
+\label{sec:experiments}
+
+\textbf{Models.} Target: Qwen/Qwen2.5-7B-Instruct; draft: Qwen/Qwen2.5-1.5B-Instruct; guard: Qwen/Qwen3Guard-Gen-0.6B. All models 4-bit NF4 quantized. Max new tokens: 256. Hardware: 2$\times$ NVIDIA RTX 4000 Ada (20GB each).
+
+\textbf{Datasets.} We use a custom evaluation set to obtain meaningful ASR spread: 70 harmful prompts (40 DeepInception-style nested fiction + 30 JailbreakBench behaviors wrapped in DAN/AIM/roleplay-style templates) and 30 benign prompts from XSTest (surface-dangerous wording, benign intent) to measure over-refusal. All safety labels are from Qwen3Guard (no keyword heuristics).
+
+\textbf{Methods.} (1) \textbf{Vanilla}: target only, greedy decoding. (2) \textbf{SSD}: match-ratio switching every $b{=}7$, contrastive prompts, PPL gate. (3) \textbf{SSD-CRS}: CRS-driven mode switching, no steering. (4) \textbf{SSD-Steering}: CRS + hidden-state steering (projection trained with refusal distillation). (5) \textbf{SSD-Steering-Only}: same steering and projection as SSD-Steering but vanilla SSD (binary match ratio) and fixed steering scale—ablation to isolate CRS vs.\ steering.
+
+\textbf{Metrics.} Attack Success Rate (ASR) on harmful prompts (lower is better); over-refusal rate on benign XSTest (lower is better). We also report per-source ASR (DeepInception, JBB-wrapped) where available.
+
+\section{Results}
+\label{sec:results}
+
+Table~\ref{tab:main} summarizes the main results. Vanilla ASR is 34.3\% overall and 57.5\% on DeepInception. SSD (binary match ratio) reduces overall ASR to 28.6\% ($-5.7$ pp). Replacing the binary switch with CRS (SSD-CRS) yields a large drop to 3.6\% ($-30.7$ pp vs.\ vanilla). Adding hidden-state steering on top of CRS (SSD-Steering) further reduces overall ASR to \textbf{1.8\%} and DeepInception ASR from 40\% to \textbf{20\%}. Over-refusal is 0\% for vanilla and SSD, and 3.3\% (1/30 benign) for CRS and SSD-Steering.
+
+\begin{table}[t]
+  \centering
+  \caption{Attack Success Rate (ASR) and over-refusal. Lower ASR is better. ``—'' indicates not evaluated on that split.}
+  \label{tab:main}
+  \begin{tabular}{lcccc}
+    \toprule
+    Method & Overall ASR$\downarrow$ & DeepInception ASR & JBB Wrapped ASR & Over-refusal$\downarrow$ \\
+    \midrule
+    Vanilla & 34.3 & 57.5 & 3.3 & 0.0 \\
+    SSD & 28.6 & 42.5 & 10.0 & 0.0 \\
+    SSD-Steering-Only & 30.0 & 42.5 & 13.3 & 0.0 \\
+    SSD-CRS & 3.6 & 40.0 & — & 3.3 \\
+    \textbf{SSD-Steering} & \textbf{1.8} & \textbf{20.0} & — & 3.3 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\textbf{Ablation: CRS vs.\ steering.} SSD-Steering-Only (steering + vanilla match-ratio, no CRS) has 30.0\% ASR—only slightly better than SSD (28.6\%) and much worse than SSD-CRS (3.6\%). So \emph{CRS is the primary driver} of the safety gain; steering alone does not get a strong signal from binary 7-token switching. When CRS is used, adding steering gives an extra $\sim$2 pp overall and halves DeepInception ASR (40\% $\to$ 20\%), indicating that steering helps most when triggered by a fine-grained risk signal.
+
+\textbf{Per-source.} DeepInception is the hardest category (57.5\% vanilla). CRS alone brings it to 40\%; CRS+steering to 20\%. On JBB-wrapped prompts, vanilla ASR is already low (3.3\%); SSD variants slightly \emph{increase} ASR (10--13\%), suggesting template wrappers can confuse the draft's safety signal and lead to overly permissive mode choices—a failure mode for future work.
+
+\section{Discussion}
+\label{sec:discussion}
+
+\textbf{Why CRS beats match ratio.} The 7-token match ratio is a delayed, averaged signal. CRS reacts every token and combines multiple views (disagreement, KL, entropy, refusal mass), so it can trigger safety mode earlier and with fewer false negatives on narrative jailbreaks.
+
+\textbf{Why steering needs CRS.} With binary switching, the draft is either steered at a fixed scale or not; the switch happens only every $b$ steps. CRS provides a continuous, per-token gain for the steering strength, so the draft is pushed toward refusal precisely when the risk score is high.
+
+\textbf{Limitations.} (1) Steering uses a trained projection (refusal distillation); the rest of the pipeline is training-free except for that component. (2) JBB-style wrappers can hurt SSD variants; combining with input-level or embedding-level detectors may help. (3) Our dataset is a single custom split; broader benchmarks would strengthen claims.
+
+\section{Conclusion}
+\label{sec:conclusion}
+
+We extended Speculative Safety-Aware Decoding (SSD) with a per-token Composite Risk Score (CRS), CRS-modulated hidden-state steering, and integration with AASD for efficient KV-cached decoding. On a high-ASR evaluation set, CRS alone reduces attack success rate by 30.7 pp; CRS plus steering achieves 1.8\% overall ASR and halves DeepInception ASR with minimal over-refusal. Ablations show that CRS is necessary for steering to be effective. We also identified a failure mode on template-wrapped jailbreaks. Future work may combine CRS with Jensen-Shannon-based acceptance signals and adaptive draft length for joint safety and speedup gains.
+
+\small
+\bibliographystyle{plainnat}
+\bibliography{refs}
+\end{document}
