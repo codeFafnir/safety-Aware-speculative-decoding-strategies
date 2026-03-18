@@ -5,9 +5,9 @@ downloaded_models/
 *.pt
 *.pth
 
-# Generated responses and metrics (machine-specific, re-run to reproduce)
+# Generated responses (machine-specific, re-run to reproduce)
 SSD_variants/responses/
-SSD_variants/results/
+# Raw response JSON files are excluded; final result summaries in results/ are committed
 
 # Python
 __pycache__/
@@ -29,3 +29,18 @@ build/
 SSD_variants/steering_ckpts/
 
 # data/ is intentionally NOT ignored — commit it for reproducibility
+
+# Report source and build artifacts
+report/
+
+# Agent / IDE state
+memory/
+.claude/
+
+# Temp / scratch files at root
+metrics.json
+
+# Unfinished / exploratory scripts
+SSD_variants/prefilling_attack.py
+SSD_variants/prefilling_llama.py
+SSD_variants/ssd_vllm.py

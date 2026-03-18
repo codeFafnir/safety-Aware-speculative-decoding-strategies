@@ -1,0 +1,140 @@
+{
+  "dataset": "35 harmful (DI-20 + JBB-15) + 15 benign (XSTest)",
+  "target": "Qwen/Qwen2.5-7B-Instruct",
+  "draft": "Qwen/Qwen2.5-1.5B-Instruct",
+  "guard": "Qwen/Qwen3Guard-Gen-0.6B",
+  "note": "Over-refusal=0.0% for all variants on 15-prompt benign subset (too small to detect; full-dataset ssd_crs shows 3.3%)",
+  "baselines": {
+    "vanilla": {
+      "asr_strict": 57.1,
+      "refusal_rate": 42.9,
+      "over_refusal_pct": 0.0,
+      "avg_response_len": 179
+    },
+    "ssd": {
+      "asr_strict": 42.9,
+      "refusal_rate": 57.1,
+      "over_refusal_pct": 0.0,
+      "avg_response_len": 208
+    }
+  },
+  "ablations": {
+    "full": {
+      "label": "Full CRS (all)",
+      "weights": {"w1": 0.3, "w2": 0.3, "w3": 0.1, "w4": 0.3},
+      "asr_strict": 37.1,
+      "refusal_rate": 62.9,
+      "controversial_pct": 0.0,
+      "over_refusal_pct": 0.0,
+      "avg_response_len": 185,
+      "union_pct": 31.3,
+      "mean_match": 0.786,
+      "mean_kl": 0.286,
+      "mean_refusal_mass": 0.0069
+    },
+    "no_match": {
+      "label": "CRS - match (w1=0)",
+      "weights": {"w1": 0.0, "w2": 0.3, "w3": 0.1, "w4": 0.3},
+      "asr_strict": 34.3,
+      "refusal_rate": 65.7,
+      "controversial_pct": 0.0,
+      "over_refusal_pct": 0.0,
+      "avg_response_len": 185,
+      "union_pct": 3.5,
+      "mean_match": 0.785,
+      "mean_kl": 0.281,
+      "mean_refusal_mass": 0.0052
+    },
+    "no_kl": {
+      "label": "CRS - KL (w2=0)",
+      "weights": {"w1": 0.3, "w2": 0.0, "w3": 0.1, "w4": 0.3},
+      "asr_strict": 37.1,
+      "refusal_rate": 62.9,
+      "controversial_pct": 0.0,
+      "over_refusal_pct": 0.0,
+      "avg_response_len": 185,
+      "union_pct": 13.2,
+      "mean_match": 0.784,
+      "mean_kl": 0.284,
+      "mean_refusal_mass": 0.0053
+    },
+    "no_dh": {
+      "label": "CRS - dH (w3=0)",
+      "weights": {"w1": 0.3, "w2": 0.3, "w3": 0.0, "w4": 0.3},
+      "asr_strict": 37.1,
+      "refusal_rate": 62.9,
+      "controversial_pct": 0.0,
+      "over_refusal_pct": 0.0,
+      "avg_response_len": 185,
+      "union_pct": 31.0,
+      "mean_match": 0.786,
+      "mean_kl": 0.286,
+      "mean_refusal_mass": 0.0069
+    },
+    "no_refusal": {
+      "label": "CRS - refusal_mass (w4=0)",
+      "weights": {"w1": 0.3, "w2": 0.3, "w3": 0.1, "w4": 0.0},
+      "asr_strict": 37.1,
+      "refusal_rate": 62.9,
+      "controversial_pct": 0.0,
+      "over_refusal_pct": 0.0,
+      "avg_response_len": 185,
+      "union_pct": 29.8,
+      "mean_match": 0.786,
+      "mean_kl": 0.286,
+      "mean_refusal_mass": 0.0069
+    },
+    "match_only": {
+      "label": "match only",
+      "weights": {"w1": 0.3, "w2": 0.0, "w3": 0.0, "w4": 0.0},
+      "asr_strict": 34.3,
+      "refusal_rate": 65.7,
+      "controversial_pct": 0.0,
+      "over_refusal_pct": 0.0,
+      "avg_response_len": 185,
+      "union_pct": 1.6,
+      "mean_match": 0.783,
+      "mean_kl": 0.284,
+      "mean_refusal_mass": 0.0053
+    },
+    "kl_only": {
+      "label": "KL only",
+      "weights": {"w1": 0.0, "w2": 0.3, "w3": 0.0, "w4": 0.0},
+      "asr_strict": 34.3,
+      "refusal_rate": 65.7,
+      "controversial_pct": 0.0,
+      "over_refusal_pct": 0.0,
+      "avg_response_len": 185,
+      "union_pct": 2.6,
+      "mean_match": 0.785,
+      "mean_kl": 0.281,
+      "mean_refusal_mass": 0.0052
+    },
+    "refusal_only": {
+      "label": "refusal_mass only",
+      "weights": {"w1": 0.0, "w2": 0.0, "w3": 0.0, "w4": 0.3},
+      "asr_strict": 34.3,
+      "refusal_rate": 62.9,
+      "controversial_pct": 2.9,
+      "over_refusal_pct": 0.0,
+      "avg_response_len": 185,
+      "union_pct": 0.4,
+      "mean_match": 0.783,
+      "mean_kl": 0.283,
+      "mean_refusal_mass": 0.0051
+    },
+    "kl_refusal": {
+      "label": "KL + refusal_mass",
+      "weights": {"w1": 0.0, "w2": 0.3, "w3": 0.0, "w4": 0.3},
+      "asr_strict": 34.3,
+      "refusal_rate": 65.7,
+      "controversial_pct": 0.0,
+      "over_refusal_pct": 0.0,
+      "avg_response_len": 185,
+      "union_pct": 3.5,
+      "mean_match": 0.785,
+      "mean_kl": 0.281,
+      "mean_refusal_mass": 0.0052
+    }
+  }
+}
