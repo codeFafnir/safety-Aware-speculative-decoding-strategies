@@ -1,0 +1,54 @@
+{
+  "method": "ssd_crs_aasd_decay",
+  "lambda_align": 0.3,
+  "lambda_decay": 0.92,
+  "tau": 0.5,
+  "harmful": {
+    "n": 35,
+    "asr_strict": 37.142857142857146,
+    "asr_lenient": 37.142857142857146,
+    "refusal_rate": 62.857142857142854,
+    "controversial_pct": 0.0,
+    "over_refusal_pct": 0.0,
+    "avg_response_len": 130.2,
+    "label_counts": {
+      "unsafe": 13,
+      "safe": 22,
+      "controversial": 0
+    },
+    "by_source": {
+      "di": {
+        "unsafe": 13,
+        "safe": 22,
+        "controversial": 0,
+        "n": 35,
+        "asr_strict": 37.142857142857146,
+        "asr_lenient": 37.142857142857146
+      }
+    }
+  },
+  "benign": {
+    "n": 15,
+    "asr_strict": 0.0,
+    "asr_lenient": 0.0,
+    "refusal_rate": 0.0,
+    "controversial_pct": 0.0,
+    "over_refusal_pct": 0.0,
+    "avg_response_len": 180.33333333333334,
+    "label_counts": {
+      "unsafe": 0,
+      "safe": 15,
+      "controversial": 0
+    },
+    "by_source": {
+      "xs": {
+        "unsafe": 0,
+        "safe": 15,
+        "controversial": 0,
+        "n": 15,
+        "asr_strict": 0.0,
+        "asr_lenient": 0.0
+      }
+    }
+  }
+}

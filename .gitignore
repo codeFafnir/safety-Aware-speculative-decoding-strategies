@@ -1,3 +1,47 @@
-secrets.txt
-*.txt
+# Model weights (large, download separately)
+downloaded_models/
+*.bin
+*.safetensors
+*.pt
+*.pth
 
+# Generated responses (machine-specific, re-run to reproduce)
+SSD_variants/responses/
+# Raw response JSON files are excluded; final result summaries in results/ are committed
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.ipynb_checkpoints/
+*.egg-info/
+dist/
+build/
+
+# Env
+.env
+*.log
+secrets.txt
+
+# OS
+.DS_Store
+
+# Steering projection checkpoints (trained weights, re-train to reproduce)
+SSD_variants/steering_ckpts/
+
+# data/ is intentionally NOT ignored — commit it for reproducibility
+
+# Report source and build artifacts
+report/
+
+# Agent / IDE state
+memory/
+.claude/
+
+# Temp / scratch files at root
+metrics.json
+
+# Unfinished / exploratory scripts
+SSD_variants/prefilling_attack.py
+SSD_variants/prefilling_llama.py
+SSD_variants/ssd_vllm.py
