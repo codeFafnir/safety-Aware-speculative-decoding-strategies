@@ -21,6 +21,7 @@ build/
 # Env
 .env
 *.log
+secrets.txt
 
 # OS
 .DS_Store
