@@ -78,6 +78,11 @@ The fix: exponential decay `λ_t = λ_0 · γ^t` (λ_0=0.3, γ=0.92). By token 5
 ## Repository Structure
 
 ```
+notebooks/                    # Early experimentation and baseline setting (see notebooks/README.md)
+├── 02_safedecoding_baseline_v2.ipynb   # SafeDecoding (Xu et al., ACL 2024) baseline
+├── 03_ssd_baseline.ipynb               # SSD faithful re-implementation + training-free extensions
+└── 04_ssd_aasd_baseline.ipynb          # SSD+AASD experiments; documents generation-collapse failure
+
 SSD_variants/
 ├── ssd_experiments.py        # Core experiment runner: vanilla / SSD / SSD-CRS
 ├── ssd_steering.py           # CRS-modulated hidden-state steering (SSD-CRS+Steering)
@@ -86,8 +91,6 @@ SSD_variants/
 ├── ssd_pplgate_ablation.py   # Perplexity gate ablation
 ├── run_crs_aasd_decay.py     # SSD-CRS-AASD with decaying λ
 ├── prepare_datasets.py       # Dataset preparation utilities
-├── 02_safedecoding_baseline_v2.ipynb   # SafeDecoding (Xu et al., ACL 2024) baseline
-├── 03_ssd_baseline.ipynb               # SSD faithful re-implementation + extensions
 ├── data/                     # Evaluation datasets (committed for reproducibility)
 │   ├── advbench.json
 │   ├── deepinception.json
